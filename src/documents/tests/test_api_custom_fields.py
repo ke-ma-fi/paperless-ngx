@@ -13,10 +13,9 @@ from rest_framework.test import APITestCase
 from documents.models import CustomField
 from documents.models import CustomFieldInstance
 from documents.models import Document
-from documents.tests.utils import DirectoriesMixin
 
 
-class TestCustomFieldsAPI(DirectoriesMixin, APITestCase):
+class TestCustomFieldsAPI(APITestCase):
     ENDPOINT = "/api/custom_fields/"
 
     def setUp(self) -> None:

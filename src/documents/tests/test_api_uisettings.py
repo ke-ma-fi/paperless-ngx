@@ -6,11 +6,10 @@ from django.test import override_settings
 from rest_framework import status
 from rest_framework.test import APITestCase
 
-from documents.tests.utils import DirectoriesMixin
 from paperless.version import __full_version_str__
 
 
-class TestApiUiSettings(DirectoriesMixin, APITestCase):
+class TestApiUiSettings(APITestCase):
     ENDPOINT = "/api/ui_settings/"
 
     def setUp(self) -> None:

@@ -14,10 +14,9 @@ from documents.models import Tag
 from documents.models import Workflow
 from documents.models import WorkflowAction
 from documents.models import WorkflowTrigger
-from documents.tests.utils import DirectoriesMixin
 
 
-class TestApiWorkflows(DirectoriesMixin, APITestCase):
+class TestApiWorkflows(APITestCase):
     ENDPOINT = "/api/workflows/"
     ENDPOINT_TRIGGERS = "/api/workflow_triggers/"
     ENDPOINT_ACTIONS = "/api/workflow_actions/"

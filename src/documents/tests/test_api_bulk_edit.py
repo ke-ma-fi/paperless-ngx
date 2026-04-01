@@ -15,10 +15,9 @@ from documents.models import Document
 from documents.models import DocumentType
 from documents.models import StoragePath
 from documents.models import Tag
-from documents.tests.utils import DirectoriesMixin
 
 
-class TestBulkEditAPI(DirectoriesMixin, APITestCase):
+class TestBulkEditAPI(APITestCase):
     @classmethod
     def setUpTestData(cls) -> None:
         super().setUpTestData()

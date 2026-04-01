@@ -8,8 +8,6 @@ from rest_framework import status
 from rest_framework.authtoken.models import Token
 from rest_framework.test import APITestCase
 
-from documents.tests.utils import DirectoriesMixin
-
 
 # see allauth.socialaccount.providers.openid.provider.OpenIDProvider
 class MockOpenIDProvider:
@@ -49,7 +47,7 @@ class MockOpenIDConnectProvider:
         return f"{self.app.provider_id}/login/?process=connect"
 
 
-class TestApiProfile(DirectoriesMixin, APITestCase):
+class TestApiProfile(APITestCase):
     ENDPOINT = "/api/profile/"
 
     def setUp(self) -> None:

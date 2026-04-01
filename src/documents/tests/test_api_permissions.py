@@ -19,10 +19,9 @@ from documents.models import DocumentType
 from documents.models import MatchingModel
 from documents.models import StoragePath
 from documents.models import Tag
-from documents.tests.utils import DirectoriesMixin
 
 
-class TestApiAuth(DirectoriesMixin, APITestCase):
+class TestApiAuth(APITestCase):
     def test_auth_required(self) -> None:
         d = Document.objects.create(title="Test")
 
@@ -654,7 +653,7 @@ class TestApiAuth(DirectoriesMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
 
-class TestApiUser(DirectoriesMixin, APITestCase):
+class TestApiUser(APITestCase):
     ENDPOINT = "/api/users/"
 
     @classmethod
@@ -996,7 +995,7 @@ class TestApiUser(DirectoriesMixin, APITestCase):
         self.assertEqual(returned_user1.is_staff, True)
 
 
-class TestApiGroup(DirectoriesMixin, APITestCase):
+class TestApiGroup(APITestCase):
     ENDPOINT = "/api/groups/"
 
     @classmethod
