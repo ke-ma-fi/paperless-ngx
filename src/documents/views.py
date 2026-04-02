@@ -2055,16 +2055,26 @@ class UnifiedSearchViewSet(DocumentViewSet):
         if not self._is_search_request():
             return super().list(request)
 
+        from documents.search import SORT_FIELD_MAP
+        from documents.search import SearchMode
         from documents.search import TantivyRelevanceList
         from documents.search import get_backend
-        from documents.search._backend import SearchMode
 
         try:
             backend = get_backend()
-            # ORM-filtered queryset: permissions + field filters + ordering (DRF backends applied)
+            # ORM queryset with field filters applied (tags, correspondent, etc.); used to
+            # intersect with tantivy results. Tantivy handles permission filtering via user param.
             filtered_qs = self.filter_queryset(self.get_queryset())
 
             user = None if request.user.is_superuser else request.user
+
+            # Parse ordering: extract field name and direction
+            raw_ordering = request.query_params.get("ordering", "")
+            sort_reverse = raw_ordering.startswith("-")
+            sort_field = raw_ordering.lstrip("-") or None
+            # Use tantivy native sorting for indexed fields; fall back to ORM for the rest
+            # (owner, storage_path__name, id, custom_field_* require ORM ordering)
+            tantivy_sort_field = sort_field if sort_field in SORT_FIELD_MAP else None
 
             if (
                 "text" in request.query_params
@@ -2080,15 +2090,31 @@ class UnifiedSearchViewSet(DocumentViewSet):
                 else:
                     search_mode = SearchMode.QUERY
                     query_str = request.query_params["query"]
-                results = backend.search(
-                    query_str,
-                    user=user,
-                    page=1,
-                    page_size=10000,
-                    sort_field=None,
-                    sort_reverse=False,
-                    search_mode=search_mode,
-                )
+
+                if tantivy_sort_field:
+                    # Tantivy handles sorting and pagination natively
+                    page_size = self.paginator.get_page_size(request)
+                    page_num = int(request.query_params.get("page", 1))
+                    results = backend.search(
+                        query_str,
+                        user=user,
+                        page=page_num,
+                        page_size=page_size,
+                        sort_field=tantivy_sort_field,
+                        sort_reverse=sort_reverse,
+                        search_mode=search_mode,
+                    )
+                else:
+                    # Relevance or ORM-sorted fallback: fetch all hits for downstream ordering
+                    results = backend.search(
+                        query_str,
+                        user=user,
+                        page=1,
+                        page_size=10000,
+                        sort_field=None,
+                        sort_reverse=False,
+                        search_mode=search_mode,
+                    )
             else:
                 # more_like_id — validate permission on the seed document first
                 try:
@@ -2112,17 +2138,44 @@ class UnifiedSearchViewSet(DocumentViewSet):
                     page=1,
                     page_size=10000,
                 )
+                tantivy_sort_field = None  # MLT always uses relevance order
 
             hits_by_id = {h["id"]: h for h in results.hits}
 
-            # Determine sort order: no ordering param -> Tantivy relevance; otherwise -> ORM order
-            ordering_param = request.query_params.get("ordering", "").lstrip("-")
-            if not ordering_param:
-                # Preserve Tantivy relevance order; intersect with ORM-visible IDs
+            if tantivy_sort_field:
+                # Tantivy sorted and paginated; intersect with ORM to apply field filters
+                orm_ids = set(filtered_qs.values_list("pk", flat=True))
+                ordered_hits = [h for h in results.hits if h["id"] in orm_ids]
+                serializer = self.get_serializer(ordered_hits, many=True)
+                response = self.get_paginated_response(serializer.data)
+                response.data["corrected_query"] = None
+                response.data["count"] = results.total
+                if get_boolean(
+                    str(request.query_params.get("include_selection_data", "false")),
+                ):
+                    # Fetch all matched IDs for selection data (separate query, ID-only)
+                    all_results = backend.search(
+                        query_str,
+                        user=user,
+                        page=1,
+                        page_size=10000,
+                        sort_field=None,
+                        sort_reverse=False,
+                        search_mode=search_mode,
+                    )
+                    all_ids = [h["id"] for h in all_results.hits]
+                    response.data["selection_data"] = (
+                        self._get_selection_data_for_queryset(
+                            filtered_qs.filter(pk__in=all_ids),
+                        )
+                    )
+                return response
+            elif not sort_field:
+                # Relevance order — preserve tantivy ranking, intersect with ORM for field filters
                 orm_ids = set(filtered_qs.values_list("pk", flat=True))
                 ordered_hits = [h for h in results.hits if h["id"] in orm_ids]
             else:
-                # Use ORM ordering (already applied by DocumentsOrderingFilter)
+                # ORM ordering fallback for fields tantivy can't sort (owner, storage_path__name, id, custom_field_*)
                 hit_ids = set(hits_by_id.keys())
                 orm_ordered_ids = filtered_qs.filter(id__in=hit_ids).values_list(
                     "pk",

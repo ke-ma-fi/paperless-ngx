@@ -1,4 +1,6 @@
+from documents.search._backend import SORT_FIELD_MAP
 from documents.search._backend import SearchIndexLockError
+from documents.search._backend import SearchMode
 from documents.search._backend import SearchResults
 from documents.search._backend import TantivyBackend
 from documents.search._backend import TantivyRelevanceList
@@ -9,7 +11,9 @@ from documents.search._schema import needs_rebuild
 from documents.search._schema import wipe_index
 
 __all__ = [
+    "SORT_FIELD_MAP",
     "SearchIndexLockError",
+    "SearchMode",
     "SearchResults",
     "TantivyBackend",
     "TantivyRelevanceList",

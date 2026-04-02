@@ -47,6 +47,20 @@ _AUTOCOMPLETE_REGEX_TIMEOUT = 1.0  # seconds; guards against ReDoS on untrusted 
 
 T = TypeVar("T")
 
+# Fields tantivy can sort natively — maps Django ORM field names to tantivy schema fields.
+# Fields not listed here (owner, storage_path__name, id, custom_field_*) must fall back to ORM.
+SORT_FIELD_MAP: dict[str, str] = {
+    "title": "title_sort",
+    "correspondent__name": "correspondent_sort",
+    "document_type__name": "type_sort",
+    "created": "created",
+    "added": "added",
+    "modified": "modified",
+    "archive_serial_number": "asn",
+    "page_count": "page_count",
+    "num_notes": "num_notes",
+}
+
 
 class SearchMode(StrEnum):
     QUERY = "query"
@@ -485,22 +499,9 @@ class TantivyBackend:
         searcher = self._index.searcher()
         offset = (page - 1) * page_size
 
-        # Map sort fields
-        sort_field_map = {
-            "title": "title_sort",
-            "correspondent__name": "correspondent_sort",
-            "document_type__name": "type_sort",
-            "created": "created",
-            "added": "added",
-            "modified": "modified",
-            "archive_serial_number": "asn",
-            "page_count": "page_count",
-            "num_notes": "num_notes",
-        }
-
         # Perform search
-        if sort_field and sort_field in sort_field_map:
-            mapped_field = sort_field_map[sort_field]
+        if sort_field and sort_field in SORT_FIELD_MAP:
+            mapped_field = SORT_FIELD_MAP[sort_field]
             results = searcher.search(
                 final_query,
                 limit=offset + page_size,
