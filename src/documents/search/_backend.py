@@ -605,26 +605,11 @@ class TantivyBackend:
         # Apply permission filter for non-superusers so autocomplete words
         # from invisible documents don't leak to other users.
         if user is not None and not user.is_superuser:
-            permission_query = build_permission_filter(self._schema, user)
+            base_query = build_permission_filter(self._schema, user)
         else:
-            permission_query = tantivy.Query.all_query()
+            base_query = tantivy.Query.all_query()
 
-        # Narrow to documents that actually contain a word starting with the
-        # prefix before loading stored fields, avoiding a full collection scan.
-        prefix_filter = tantivy.Query.regex_query(
-            self._schema,
-            "autocomplete_word",
-            regex.escape(normalized_term) + ".*",
-        )
-        results = searcher.search(
-            tantivy.Query.boolean_query(
-                [
-                    (tantivy.Occur.Must, permission_query),
-                    (tantivy.Occur.Must, prefix_filter),
-                ],
-            ),
-            limit=10000,
-        )
+        results = searcher.search(base_query, limit=10000)
 
         # Count how many visible documents each word appears in.
         # Using Counter (not set) preserves per-word document frequency so
