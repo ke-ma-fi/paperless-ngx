@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("paperless.search")
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def build_schema() -> tantivy.Schema:
@@ -57,12 +57,12 @@ def build_schema() -> tantivy.Schema:
     sb.add_text_field(
         "simple_title",
         stored=False,
-        tokenizer_name="simple_search_analyzer",
+        tokenizer_name="trigram_analyzer",
     )
     sb.add_text_field(
         "simple_content",
         stored=False,
-        tokenizer_name="simple_search_analyzer",
+        tokenizer_name="trigram_analyzer",
     )
 
     # Autocomplete prefix scan - stored, not indexed
