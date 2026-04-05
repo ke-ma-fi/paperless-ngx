@@ -468,7 +468,13 @@ class TantivyBackend:
         self._ensure_open()
 
         user_id = user.pk if user is not None else None
-        cached = get_search_results_cache(query, search_mode, user_id, sort_field, sort_reverse)
+        cached = get_search_results_cache(
+            query,
+            search_mode,
+            user_id,
+            sort_field,
+            sort_reverse=sort_reverse,
+        )
         if cached is not None:
             return cached
 
@@ -599,7 +605,14 @@ class TantivyBackend:
             total=total,
             query=query,
         )
-        set_search_results_cache(query, search_mode, user_id, sort_field, sort_reverse, search_results)
+        set_search_results_cache(
+            query,
+            search_mode,
+            user_id,
+            sort_field,
+            sort_reverse=sort_reverse,
+            results=search_results,
+        )
         return search_results
 
     def autocomplete(

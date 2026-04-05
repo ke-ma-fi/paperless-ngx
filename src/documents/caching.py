@@ -377,6 +377,7 @@ def _search_cache_key(
     search_mode: str,
     user_id: int | None,
     sort_field: str | None,
+    *,
     sort_reverse: bool,
 ) -> str:
     generation = _get_search_generation()
@@ -391,10 +392,17 @@ def get_search_results_cache(
     search_mode: str,
     user_id: int | None,
     sort_field: str | None,
+    *,
     sort_reverse: bool,
 ) -> SearchResults | None:
     """Return cached SearchResults for the given parameters, or None on a miss."""
-    key = _search_cache_key(query, search_mode, user_id, sort_field, sort_reverse)
+    key = _search_cache_key(
+        query,
+        search_mode,
+        user_id,
+        sort_field,
+        sort_reverse=sort_reverse,
+    )
     return read_cache.get(key)
 
 
@@ -403,9 +411,16 @@ def set_search_results_cache(
     search_mode: str,
     user_id: int | None,
     sort_field: str | None,
+    *,
     sort_reverse: bool,
     results: SearchResults,
 ) -> None:
     """Store SearchResults in the cache."""
-    key = _search_cache_key(query, search_mode, user_id, sort_field, sort_reverse)
+    key = _search_cache_key(
+        query,
+        search_mode,
+        user_id,
+        sort_field,
+        sort_reverse=sort_reverse,
+    )
     read_cache.set(key, results, settings.CACHALOT_TIMEOUT)
