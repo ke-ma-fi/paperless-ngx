@@ -509,7 +509,7 @@ class TantivyBackend:
     def _fetch_all_hits(
         self,
         query: str,
-        search_mode: str,
+        search_mode: SearchMode,
         user_id: int | None,
         final_query: tantivy.Query,
         sort_field: str | None,
