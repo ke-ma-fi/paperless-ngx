@@ -185,6 +185,39 @@ class TestSearchCacheFunctions:
             get_search_results_cache("q", "text", 1, None, sort_reverse=False) is None
         )
 
+    def test_generation_key_has_no_expiry(self) -> None:
+        """Generation key must be stored without TTL so it cannot expire and silently
+        reset to 0, which would make stale cache entries reachable again."""
+        from django.core.cache import caches
+
+        from documents.caching import SEARCH_GENERATION_KEY
+        from documents.caching import read_cache
+
+        bump_search_cache_generation()
+
+        # Simulate expiry of the generation key by deleting it directly.
+        read_cache.delete(SEARCH_GENERATION_KEY)
+
+        # After expiry, bump must re-initialise without TTL.
+        bump_search_cache_generation()
+
+        # Verify the key now has no TTL (ttl returns None or -1 depending on backend).
+        # Django's LocMemCache doesn't expose ttl(), so we check via the underlying
+        # _expire_info dict when available; otherwise just confirm the key exists.
+        raw_cache = caches["read-cache"]
+        if hasattr(raw_cache, "_expire_info"):
+            import time
+
+            expire_at = raw_cache._expire_info.get(
+                raw_cache.make_key(SEARCH_GENERATION_KEY),
+            )
+            assert expire_at is None or expire_at > time.time() + 86400 * 3650, (
+                "Generation key must not have a short TTL"
+            )
+        else:
+            # For Redis or other backends, just confirm the key is still present.
+            assert read_cache.get(SEARCH_GENERATION_KEY) is not None
+
 
 class TestSearchCacheIntegration:
     """Integration tests: cache is populated and invalidated via TantivyBackend."""

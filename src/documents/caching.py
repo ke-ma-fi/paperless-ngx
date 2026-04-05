@@ -365,11 +365,21 @@ def _get_search_generation() -> int:
 
 
 def bump_search_cache_generation() -> None:
-    """Invalidate all cached search results by advancing the generation counter."""
+    """Invalidate all cached search results by advancing the generation counter.
+
+    The generation key is stored without expiration (timeout=None) so it can
+    never silently reset to 0.  If the key expired before this call (e.g. on a
+    freshly flushed cache), incr() raises ValueError and we initialise it to 1
+    with no TTL.  After a successful incr() we explicitly clear the TTL via
+    touch() because the key may have been created with a finite TTL during a
+    previous ValueError path in an older deployment.
+    """
     try:
         read_cache.incr(SEARCH_GENERATION_KEY)
     except ValueError:
-        read_cache.set(SEARCH_GENERATION_KEY, 1, settings.CACHALOT_TIMEOUT)
+        read_cache.set(SEARCH_GENERATION_KEY, 1, None)
+    else:
+        read_cache.touch(SEARCH_GENERATION_KEY, None)
 
 
 def _search_cache_key(
