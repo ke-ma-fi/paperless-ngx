@@ -187,6 +187,91 @@ class TestSearch:
         )
         assert non_match.total == 0
 
+    def test_text_mode_does_not_match_scattered_trigrams(
+        self,
+        backend: TantivyBackend,
+    ):
+        """
+        A document that contains all query trigrams scattered across different words
+        must NOT match, because the query string does not appear as a connected substring.
+
+        Example: query "abcde" has trigrams [abc, bcd, cde].
+        Content "abcXXXbcde" contains all three trigrams (abc from "abcXXX", bcd/cde
+        from "bcde") but does NOT contain the substring "abcde" — this is a false
+        positive that the post-filter must eliminate.
+        """
+        # "passcode assword" contains all trigrams of "password"
+        # (pas, ass from "passcode"/"assword", ssw, swo, wor, ord from "assword")
+        # but the substring "password" does not appear.
+        doc_false_positive = Document.objects.create(
+            title="passcode assword reset",
+            content="user login credentials",
+            checksum="FP1",
+            pk=200,
+        )
+        doc_true_positive = Document.objects.create(
+            title="password reset guide",
+            content="change your password here",
+            checksum="FP2",
+            pk=201,
+        )
+        backend.add_or_update(doc_false_positive)
+        backend.add_or_update(doc_true_positive)
+
+        results = backend.search(
+            "password",
+            user=None,
+            page=1,
+            page_size=10,
+            sort_field=None,
+            sort_reverse=False,
+            search_mode=SearchMode.TEXT,
+        )
+        result_ids = {hit["id"] for hit in results.hits}
+
+        assert doc_true_positive.id in result_ids, "True positive must match"
+        assert doc_false_positive.id not in result_ids, (
+            "Document with scattered trigrams must not match"
+        )
+        assert results.total == 1
+
+    def test_title_mode_does_not_match_scattered_trigrams(
+        self,
+        backend: TantivyBackend,
+    ):
+        """Title mode must also eliminate scattered-trigram false positives in the title."""
+        doc_false_positive = Document.objects.create(
+            title="passcode assword reset",
+            content="irrelevant content",
+            checksum="FP3",
+            pk=202,
+        )
+        doc_true_positive = Document.objects.create(
+            title="password guide",
+            content="irrelevant content",
+            checksum="FP4",
+            pk=203,
+        )
+        backend.add_or_update(doc_false_positive)
+        backend.add_or_update(doc_true_positive)
+
+        results = backend.search(
+            "password",
+            user=None,
+            page=1,
+            page_size=10,
+            sort_field=None,
+            sort_reverse=False,
+            search_mode=SearchMode.TITLE,
+        )
+        result_ids = {hit["id"] for hit in results.hits}
+
+        assert doc_true_positive.id in result_ids, "True positive must match"
+        assert doc_false_positive.id not in result_ids, (
+            "Title with scattered trigrams must not match"
+        )
+        assert results.total == 1
+
     def test_text_mode_short_token_matches_all_containing_docs(
         self,
         backend: TantivyBackend,

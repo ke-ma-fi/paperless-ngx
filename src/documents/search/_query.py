@@ -565,6 +565,28 @@ def parse_simple_query(
     return tantivy.Query.boolean_query(field_queries)
 
 
+def get_simple_query_tokens(raw_query: str) -> list[str]:
+    """
+    Return the normalized tokens from a simple query that are long enough to generate trigrams.
+
+    Applies the same normalization (lowercase + ASCII fold) as ``parse_simple_query``
+    and returns only tokens with at least 3 characters — shorter tokens produce no
+    trigrams and therefore cannot contribute to false positives.
+
+    The returned tokens can be used to post-filter Tantivy trigram candidates:
+    a result is a true positive only if every token from this list appears as a
+    substring in the relevant document fields.
+    """
+    try:
+        tokens = [
+            ascii_fold(token.lower())
+            for token in _SIMPLE_QUERY_TOKEN_RE.findall(raw_query, timeout=_REGEX_TIMEOUT)
+        ]
+    except TimeoutError:
+        return []
+    return [token for token in tokens if len(token) >= 3]
+
+
 def parse_simple_text_query(
     index: tantivy.Index,
     raw_query: str,

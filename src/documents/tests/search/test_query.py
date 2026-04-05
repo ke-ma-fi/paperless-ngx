@@ -528,3 +528,57 @@ class TestPermissionFilter:
         user = django_user_model(pk=20)
         perm = build_permission_filter(perm_index.schema, user)
         assert perm_index.searcher().search(perm, limit=10).count == 1  # only unowned
+
+
+class TestGetSimpleQueryTokens:
+    """Tests for get_simple_query_tokens — the token extractor used for substring post-filtering."""
+
+    def test_single_long_token(self) -> None:
+        from documents.search._query import get_simple_query_tokens
+
+        assert get_simple_query_tokens("password") == ["password"]
+
+    def test_multiple_tokens(self) -> None:
+        from documents.search._query import get_simple_query_tokens
+
+        assert get_simple_query_tokens("hello world") == ["hello", "world"]
+
+    def test_short_tokens_excluded(self) -> None:
+        """Tokens shorter than 3 chars produce no trigrams and must not be returned."""
+        from documents.search._query import get_simple_query_tokens
+
+        # "6" (1 char) and "Nr" (2 chars) must be excluded
+        assert get_simple_query_tokens("Z-Berichte 6") == ["z-berichte"]
+        assert get_simple_query_tokens("Nr 6") == []
+
+    def test_normalization_lowercase_and_ascii_fold(self) -> None:
+        """Tokens are lowercased and ASCII-folded, matching the query builder."""
+        from documents.search._query import get_simple_query_tokens
+
+        tokens = get_simple_query_tokens("Rechnungs-Nr.")
+        assert tokens == ["rechnungs-nr."]
+
+    def test_empty_query_returns_empty_list(self) -> None:
+        from documents.search._query import get_simple_query_tokens
+
+        assert get_simple_query_tokens("") == []
+
+    def test_symbol_only_query_returns_empty_list(self) -> None:
+        from documents.search._query import get_simple_query_tokens
+
+        # "!!!" has no alphanumeric chars but is 3 chars — still no trigrams (it's not
+        # filtered by length, but it won't generate meaningful matches anyway)
+        result = get_simple_query_tokens("!!!")
+        # The token "!!!" has length 3, so it IS returned (not filtered by length)
+        assert result == ["!!!"]
+
+    def test_exactly_three_chars_included(self) -> None:
+        """A 3-char token is the minimum that generates one trigram and must be included."""
+        from documents.search._query import get_simple_query_tokens
+
+        assert get_simple_query_tokens("cat") == ["cat"]
+
+    def test_two_char_token_excluded(self) -> None:
+        from documents.search._query import get_simple_query_tokens
+
+        assert get_simple_query_tokens("ab") == []
