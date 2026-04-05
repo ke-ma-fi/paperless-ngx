@@ -554,7 +554,7 @@ class TantivyBackend:
         if is_simple_mode:
             tokens = get_simple_query_tokens(query)
             if tokens:
-                filtered: list[tuple] = []
+                filtered: list[tuple[tantivy.DocAddress, float]] = []
                 for doc_address, score in all_hits:
                     doc_obj = searcher.doc(doc_address)
                     doc_dict = doc_obj.to_dict()

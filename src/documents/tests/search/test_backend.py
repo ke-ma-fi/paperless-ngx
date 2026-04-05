@@ -200,8 +200,9 @@ class TestSearch:
         from "bcde") but does NOT contain the substring "abcde" — this is a false
         positive that the post-filter must eliminate.
         """
-        # "passcode assword" contains all trigrams of "password"
-        # (pas, ass from "passcode"/"assword", ssw, swo, wor, ord from "assword")
+        # "passcode assword" contains all trigrams of "password":
+        # "passcode" → pas; "assword" → ass, ssw, swo, wor, ord
+        # (a-s-s-w-o-r-d: positions 0-2=ass, 1-3=ssw, 2-4=swo, 3-5=wor, 4-6=ord)
         # but the substring "password" does not appear.
         doc_false_positive = Document.objects.create(
             title="passcode assword reset",
