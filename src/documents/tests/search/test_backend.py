@@ -187,11 +187,19 @@ class TestSearch:
         )
         assert non_match.total == 0
 
-    def test_text_mode_anchors_later_query_tokens_to_token_starts(
+    def test_text_mode_short_token_matches_all_containing_docs(
         self,
         backend: TantivyBackend,
     ):
-        """Multi-token simple search should not match later tokens in the middle of a word."""
+        """
+        With trigram search, tokens shorter than 3 chars produce no trigrams and
+        are therefore skipped — they provide no additional filtering.
+
+        Searching "Z-Berichte 6" filters on the "z-berichte" trigrams only.
+        All three documents match because they all contain "z-berichte" and
+        the single-char token "6" cannot be represented as a trigram in this
+        backend.
+        """
         exact_doc = Document.objects.create(
             title="Z-Berichte 6",
             content="monthly report",
@@ -204,7 +212,7 @@ class TestSearch:
             checksum="TXT10",
             pk=16,
         )
-        false_positive = Document.objects.create(
+        also_matches = Document.objects.create(
             title="Z-Berichte 16",
             content="monthly report",
             checksum="TXT11",
@@ -212,7 +220,7 @@ class TestSearch:
         )
         backend.add_or_update(exact_doc)
         backend.add_or_update(prefix_doc)
-        backend.add_or_update(false_positive)
+        backend.add_or_update(also_matches)
 
         results = backend.search(
             "Z-Berichte 6",
@@ -225,9 +233,42 @@ class TestSearch:
         )
         result_ids = {hit["id"] for hit in results.hits}
 
+        # All three match: "6" (1 char) generates no trigrams → no filtering on it
         assert exact_doc.id in result_ids
         assert prefix_doc.id in result_ids
-        assert false_positive.id not in result_ids
+        assert also_matches.id in result_ids
+
+    def test_text_mode_trigrams_span_punctuation(
+        self,
+        backend: TantivyBackend,
+    ):
+        """
+        Trigrams are applied to the raw character stream without word splitting,
+        so they span punctuation boundaries. Searching for a substring that crosses
+        a hyphen (e.g. "gs-N") correctly matches "Rechnungs-Nr."
+
+        This was a known failure of the previous regex-based approach, which
+        operated on tokenized terms and could not match substrings spanning
+        punctuation boundaries.
+        """
+        doc = Document.objects.create(
+            title="Rechnungs-Nr. 12345",
+            content="Quarterly invoice",
+            checksum="TGRAM1",
+            pk=50,
+        )
+        backend.add_or_update(doc)
+
+        cross_punct = backend.search(
+            "gs-N",
+            user=None,
+            page=1,
+            page_size=10,
+            sort_field=None,
+            sort_reverse=False,
+            search_mode=SearchMode.TEXT,
+        )
+        assert cross_punct.total == 1
 
     def test_text_mode_ignores_queries_without_searchable_tokens(
         self,

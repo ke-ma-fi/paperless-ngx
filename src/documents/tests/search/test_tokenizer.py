@@ -8,7 +8,7 @@ import tantivy
 
 from documents.search._tokenizer import _bigram_analyzer
 from documents.search._tokenizer import _paperless_text
-from documents.search._tokenizer import _simple_search_analyzer
+from documents.search._tokenizer import _trigram_analyzer
 from documents.search._tokenizer import register_tokenizers
 
 if TYPE_CHECKING:
@@ -44,16 +44,16 @@ class TestTokenizers:
 
     @pytest.fixture
     def simple_search_index(self) -> tantivy.Index:
-        """Index with simple-search field for Latin substring tests."""
+        """Index with trigram field for Latin substring tests."""
         sb = tantivy.SchemaBuilder()
         sb.add_text_field(
             "simple_content",
             stored=False,
-            tokenizer_name="simple_search_analyzer",
+            tokenizer_name="trigram_analyzer",
         )
         schema = sb.build()
         idx = tantivy.Index(schema, path=None)
-        idx.register_tokenizer("simple_search_analyzer", _simple_search_analyzer())
+        idx.register_tokenizer("trigram_analyzer", _trigram_analyzer())
         return idx
 
     def test_ascii_fold_finds_accented_content(
@@ -81,21 +81,37 @@ class TestTokenizers:
         q = bigram_index.parse_query("東京", ["bigram_content"])
         assert bigram_index.searcher().search(q, limit=5).count == 1
 
-    def test_simple_search_analyzer_supports_regex_substrings(
+    def test_trigram_analyzer_supports_substring_matching(
         self,
         simple_search_index: tantivy.Index,
     ) -> None:
-        """Whitespace-preserving simple search analyzer supports substring regex matching."""
+        """Trigram analyzer enables substring matching via AND of term queries."""
         writer = simple_search_index.writer()
         doc = tantivy.Document()
         doc.add_text("simple_content", "tag:invoice password-reset")
         writer.add_document(doc)
         writer.commit()
         simple_search_index.reload()
-        q = tantivy.Query.regex_query(
-            simple_search_index.schema,
-            "simple_content",
-            ".*sswo.*",
+        # "sswo" → trigrams: ssw, swo — both must be present
+        q = tantivy.Query.boolean_query(
+            [
+                (
+                    tantivy.Occur.Must,
+                    tantivy.Query.term_query(
+                        simple_search_index.schema,
+                        "simple_content",
+                        "ssw",
+                    ),
+                ),
+                (
+                    tantivy.Occur.Must,
+                    tantivy.Query.term_query(
+                        simple_search_index.schema,
+                        "simple_content",
+                        "swo",
+                    ),
+                ),
+            ],
         )
         assert simple_search_index.searcher().search(q, limit=5).count == 1
 

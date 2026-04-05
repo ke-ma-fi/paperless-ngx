@@ -70,7 +70,7 @@ def register_tokenizers(index: tantivy.Index, language: str | None) -> None:
     index.register_tokenizer("paperless_text", _paperless_text(language))
     index.register_tokenizer("simple_analyzer", _simple_analyzer())
     index.register_tokenizer("bigram_analyzer", _bigram_analyzer())
-    index.register_tokenizer("simple_search_analyzer", _simple_search_analyzer())
+    index.register_tokenizer("trigram_analyzer", _trigram_analyzer())
     # Fast-field tokenizer required for fast=True text fields in the schema
     index.register_fast_field_tokenizer("simple_analyzer", _simple_analyzer())
 
@@ -117,13 +117,12 @@ def _bigram_analyzer() -> tantivy.TextAnalyzer:
     )
 
 
-def _simple_search_analyzer() -> tantivy.TextAnalyzer:
-    """Tokenizer for simple substring search fields: non-whitespace chunks -> remove_long(65) -> lowercase -> ascii_fold."""
+def _trigram_analyzer() -> tantivy.TextAnalyzer:
+    """Enables trigram-based substring search: ngram(3,3) -> lowercase -> ascii_fold. No word splitting — trigrams span punctuation and spaces."""
     return (
         tantivy.TextAnalyzerBuilder(
-            tantivy.Tokenizer.regex(r"\S+"),
+            tantivy.Tokenizer.ngram(min_gram=3, max_gram=3, prefix_only=False),
         )
-        .filter(tantivy.Filter.remove_long(65))
         .filter(tantivy.Filter.lowercase())
         .filter(tantivy.Filter.ascii_fold())
         .build()

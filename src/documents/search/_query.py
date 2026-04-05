@@ -445,31 +445,36 @@ _FIELD_BOOSTS = {"title": 2.0}
 _SIMPLE_FIELD_BOOSTS = {"simple_title": 2.0}
 
 
-def _build_simple_field_query(
+def _trigrams(text: str) -> list[str]:
+    """Generate character-level trigrams. Returns empty list for text shorter than 3 chars."""
+    return [text[i : i + 3] for i in range(len(text) - 2)]
+
+
+def _build_trigram_field_query(
     index: tantivy.Index,
     field: str,
-    tokens: list[str],
-) -> tantivy.Query:
-    patterns = []
-    for idx, token in enumerate(tokens):
-        escaped = regex.escape(token)
-        # For multi-token substring search, only the first token can begin mid-word.
-        # Later tokens follow a whitespace boundary in the original query, so anchor
-        # them to the start of the next indexed token to reduce false positives like
-        # matching "Z-Berichte 16" for the query "Z-Berichte 6".
-        if idx == 0:
-            patterns.append(f".*{escaped}.*")
-        else:
-            patterns.append(f"{escaped}.*")
-    if len(patterns) == 1:
-        query = tantivy.Query.regex_query(index.schema, field, patterns[0])
-    else:
-        query = tantivy.Query.regex_phrase_query(index.schema, field, patterns)
+    tokens: list[str],  # already lowercased + ascii-folded
+) -> tantivy.Query | None:
+    all_trigrams = list(
+        dict.fromkeys(tgm for token in tokens for tgm in _trigrams(token)),
+    )
+    if not all_trigrams:
+        return None  # all tokens < 3 chars — no trigrams possible
+
+    subqueries = [
+        (tantivy.Occur.Must, tantivy.Query.term_query(index.schema, field, tgm))
+        for tgm in all_trigrams
+    ]
+    q = (
+        tantivy.Query.boolean_query(subqueries)
+        if len(subqueries) > 1
+        else subqueries[0][1]
+    )
 
     boost = _SIMPLE_FIELD_BOOSTS.get(field, 1.0)
     if boost > 1.0:
-        return tantivy.Query.boost_query(query, boost)
-    return query
+        return tantivy.Query.boost_query(q, boost)
+    return q
 
 
 def parse_user_query(
@@ -549,9 +554,12 @@ def parse_simple_query(
         return tantivy.Query.empty_query()
 
     field_queries = [
-        (tantivy.Occur.Should, _build_simple_field_query(index, field, tokens))
+        (tantivy.Occur.Should, q)
         for field in fields
+        if (q := _build_trigram_field_query(index, field, tokens)) is not None
     ]
+    if not field_queries:
+        return tantivy.Query.empty_query()  # all tokens < 3 chars
     if len(field_queries) == 1:
         return field_queries[0][1]
     return tantivy.Query.boolean_query(field_queries)
