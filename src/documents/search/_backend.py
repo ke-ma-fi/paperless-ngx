@@ -20,7 +20,6 @@ from django.utils.timezone import get_current_timezone
 from guardian.shortcuts import get_users_with_perms
 
 from documents.search._normalize import ascii_fold
-from documents.search._normalize import word_trigrams_text
 from documents.search._query import build_permission_filter
 from documents.search._query import parse_simple_text_query
 from documents.search._query import parse_simple_title_query
@@ -47,6 +46,31 @@ _WORD_RE = regex.compile(r"\w+")
 _AUTOCOMPLETE_REGEX_TIMEOUT = 1.0  # seconds; guards against ReDoS on untrusted content
 
 T = TypeVar("T")
+
+
+def _recheck_simple_hits(
+    searcher: tantivy.Searcher,
+    hits: list[tuple],
+    tokens: list[str],
+    title_only: bool,
+) -> list[tuple]:
+    """Filter trigram candidates by verifying tokens appear as substrings in stored text.
+
+    Eliminates false positives that the trigram AND query admits (same strategy
+    as pg_trgm: GIN/inverted-index scan for candidates, then LIKE/substring recheck).
+    """
+    verified = []
+    for addr, score in hits:
+        doc = searcher.doc(addr).to_dict()
+        title = ascii_fold((doc.get("title") or [""])[0].lower())
+        if title_only:
+            haystack = title
+        else:
+            content = ascii_fold((doc.get("content") or [""])[0].lower())
+            haystack = title + " " + content
+        if all(token in haystack for token in tokens):
+            verified.append((addr, score))
+    return verified
 
 
 class SearchMode(StrEnum):
@@ -294,10 +318,10 @@ class TantivyBackend:
         doc.add_text("checksum", document.checksum)
         doc.add_text("title", document.title)
         doc.add_text("title_sort", document.title)
-        doc.add_text("simple_title", word_trigrams_text(document.title))
+        doc.add_text("simple_title", document.title)
         doc.add_text("content", content)
         doc.add_text("bigram_content", content)
-        doc.add_text("simple_content", word_trigrams_text(content))
+        doc.add_text("simple_content", content)
 
         # Original filename - only add if not None/empty
         if document.original_filename:
@@ -499,12 +523,18 @@ class TantivyBackend:
             "num_notes": "num_notes",
         }
 
+        # results.count returns the true total regardless of the fetch limit, so
+        # we only need to fetch enough candidates to fill the recheck window for
+        # the current page — not a large candidate pool.
+        is_simple = search_mode in (SearchMode.TEXT, SearchMode.TITLE)
+        fetch_limit = offset + (page_size * 3 if is_simple else page_size)
+
         # Perform search
         if sort_field and sort_field in sort_field_map:
             mapped_field = sort_field_map[sort_field]
             results = searcher.search(
                 final_query,
-                limit=offset + page_size,
+                limit=fetch_limit,
                 order_by_field=mapped_field,
                 order=tantivy.Order.Desc if sort_reverse else tantivy.Order.Asc,
             )
@@ -512,10 +542,36 @@ class TantivyBackend:
             all_hits = [(hit[1], 0.0) for hit in results.hits]
         else:
             # Score-based search: hits are (score, DocAddress) tuples
-            results = searcher.search(final_query, limit=offset + page_size)
+            results = searcher.search(final_query, limit=fetch_limit)
             all_hits = [(hit[1], hit[0]) for hit in results.hits]
 
+        # For simple search: mirror pg_trgm's strategy exactly.
+        # Use results.count as an approximate total (GIN-candidate count, may include
+        # rare false positives — same as pg_trgm's behaviour for paginated queries).
+        # Only recheck the small window of candidates for the current page, keeping
+        # the number of searcher.doc() FFI calls to ~3×page_size instead of the full
+        # candidate set, which is what made the previous approach slow.
         total = results.count
+
+        if is_simple:
+            recheck_tokens = [
+                ascii_fold(t.lower())
+                for t in query.split()
+                if len(ascii_fold(t.lower())) >= 3
+            ]
+            if recheck_tokens:
+                # Overfetch 3× to absorb the rare false positive in the window.
+                window = all_hits[offset : offset + page_size * 3]
+                verified = _recheck_simple_hits(
+                    searcher,
+                    window,
+                    recheck_tokens,
+                    title_only=search_mode is SearchMode.TITLE,
+                )
+                # Replace all_hits with just the verified page slice and reset offset
+                # so the downstream pagination step picks them up correctly.
+                all_hits = verified[:page_size]
+                offset = 0
 
         # Normalize scores for score-based searches
         if not sort_field and all_hits:

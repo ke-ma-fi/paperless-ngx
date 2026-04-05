@@ -455,34 +455,24 @@ def _build_trigram_field_query(
     field: str,
     tokens: list[str],  # already lowercased + ascii-folded
 ) -> tantivy.Query | None:
-    # Each token gets its own phrase query with (position, trigram) offsets.
-    # At index time, text is pre-processed into per-word trigrams with the
-    # whitespace tokenizer, so consecutive trigrams from a single word land at
-    # consecutive posting-list positions. phrase_query enforces this: a match
-    # requires all trigrams to appear consecutively — i.e. the substring is
-    # actually present in a single word — eliminating false positives.
-    per_token_queries = []
-    for token in tokens:
-        trigrams = _trigrams(token)
-        if not trigrams:
-            continue
-        if len(trigrams) == 1:
-            q = tantivy.Query.term_query(index.schema, field, trigrams[0])
-        else:
-            q = tantivy.Query.phrase_query(
-                index.schema, field, list(enumerate(trigrams))
-            )
-        per_token_queries.append(q)
-
-    if not per_token_queries:
+    # Boolean AND of all trigrams across all tokens — fast inverted-index lookup
+    # with index_option="basic" (doc IDs only, no positions). This mirrors how
+    # pg_trgm works: find candidates cheaply, then recheck in the backend.
+    all_trigrams = list(
+        dict.fromkeys(tgm for token in tokens for tgm in _trigrams(token)),
+    )
+    if not all_trigrams:
         return None  # all tokens < 3 chars — no trigrams possible
 
-    if len(per_token_queries) == 1:
-        q = per_token_queries[0]
-    else:
-        q = tantivy.Query.boolean_query(
-            [(tantivy.Occur.Must, pq) for pq in per_token_queries]
-        )
+    subqueries = [
+        (tantivy.Occur.Must, tantivy.Query.term_query(index.schema, field, tgm))
+        for tgm in all_trigrams
+    ]
+    q = (
+        tantivy.Query.boolean_query(subqueries)
+        if len(subqueries) > 1
+        else subqueries[0][1]
+    )
 
     boost = _SIMPLE_FIELD_BOOSTS.get(field, 1.0)
     if boost > 1.0:

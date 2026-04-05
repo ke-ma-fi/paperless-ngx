@@ -70,6 +70,7 @@ def register_tokenizers(index: tantivy.Index, language: str | None) -> None:
     index.register_tokenizer("paperless_text", _paperless_text(language))
     index.register_tokenizer("simple_analyzer", _simple_analyzer())
     index.register_tokenizer("bigram_analyzer", _bigram_analyzer())
+    index.register_tokenizer("trigram_analyzer", _trigram_analyzer())
     # Fast-field tokenizer required for fast=True text fields in the schema
     index.register_fast_field_tokenizer("simple_analyzer", _simple_analyzer())
 
@@ -99,6 +100,20 @@ def _simple_analyzer() -> tantivy.TextAnalyzer:
     """Tokenizer for shadow sort fields (title_sort, correspondent_sort, type_sort): simple -> lowercase -> ascii_fold."""
     return (
         tantivy.TextAnalyzerBuilder(tantivy.Tokenizer.simple())
+        .filter(tantivy.Filter.lowercase())
+        .filter(tantivy.Filter.ascii_fold())
+        .build()
+    )
+
+
+def _trigram_analyzer() -> tantivy.TextAnalyzer:
+    """Character-level trigrams for fast substring candidate lookup (like pg_trgm).
+    Indexed with index_option='basic' (doc IDs only) — positions not stored.
+    Query results require a Python substring recheck to eliminate false positives."""
+    return (
+        tantivy.TextAnalyzerBuilder(
+            tantivy.Tokenizer.ngram(min_gram=3, max_gram=3, prefix_only=False),
+        )
         .filter(tantivy.Filter.lowercase())
         .filter(tantivy.Filter.ascii_fold())
         .build()
