@@ -19,6 +19,9 @@ from django.conf import settings
 from django.utils.timezone import get_current_timezone
 from guardian.shortcuts import get_users_with_perms
 
+from documents.caching import bump_search_cache_generation
+from documents.caching import get_search_results_cache
+from documents.caching import set_search_results_cache
 from documents.search._normalize import ascii_fold
 from documents.search._query import build_permission_filter
 from documents.search._query import parse_simple_text_query
@@ -172,6 +175,7 @@ class WriteBatch:
             if exc_type is None:
                 self._writer.commit()
                 self._backend._index.reload()
+                bump_search_cache_generation()
             # Explicitly delete writer to release tantivy's internal lock.
             # On exception the uncommitted writer is simply discarded.
             if self._writer is not None:
@@ -462,6 +466,12 @@ class TantivyBackend:
             SearchResults with hits, total count, and processed query
         """
         self._ensure_open()
+
+        user_id = user.pk if user is not None else None
+        cached = get_search_results_cache(query, search_mode, user_id, sort_field, sort_reverse)
+        if cached is not None:
+            return cached
+
         tz = get_current_timezone()
         if search_mode is SearchMode.TEXT:
             user_query = parse_simple_text_query(self._index, query)
@@ -584,11 +594,13 @@ class TantivyBackend:
                 ),
             )
 
-        return SearchResults(
+        search_results = SearchResults(
             hits=hits,
             total=total,
             query=query,
         )
+        set_search_results_cache(query, search_mode, user_id, sort_field, sort_reverse, search_results)
+        return search_results
 
     def autocomplete(
         self,
@@ -812,6 +824,7 @@ class TantivyBackend:
                 writer.add_document(doc)
             writer.commit()
             new_index.reload()
+            bump_search_cache_generation()
         except BaseException:  # pragma: no cover
             # Restore old index on failure so the backend remains usable
             self._index = old_index
