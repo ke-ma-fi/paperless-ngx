@@ -98,17 +98,17 @@ class TestTokenizers:
                 (
                     tantivy.Occur.Must,
                     tantivy.Query.term_query(
-                        simple_search_index.schema, 
-                        "simple_content", 
-                        "ssw"
+                        simple_search_index.schema,
+                        "simple_content",
+                        "ssw",
                     ),
                 ),
                 (
                     tantivy.Occur.Must,
                     tantivy.Query.term_query(
-                        simple_search_index.schema, 
-                        "simple_content", 
-                        "swo"
+                        simple_search_index.schema,
+                        "simple_content",
+                        "swo",
                     ),
                 ),
             ],
