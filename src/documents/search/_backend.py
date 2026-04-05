@@ -24,9 +24,11 @@ from documents.caching import get_search_results_cache
 from documents.caching import set_search_results_cache
 from documents.search._normalize import ascii_fold
 from documents.search._query import build_permission_filter
+from documents.search._query import normalize_query
 from documents.search._query import parse_simple_text_query
 from documents.search._query import parse_simple_title_query
 from documents.search._query import parse_user_query
+from documents.search._query import rewrite_natural_date_keywords
 from documents.search._schema import _write_sentinels
 from documents.search._schema import build_schema
 from documents.search._schema import open_or_rebuild_index
@@ -105,6 +107,34 @@ class SearchResults:
     hits: list[SearchHit]
     total: int  # total matching documents (for pagination)
     query: str  # preprocessed query string
+
+
+@dataclass(frozen=True, slots=True)
+class _HitRecord:
+    """Lightweight per-hit record stored in the search cache.
+
+    Uses tantivy.DocAddress (picklable via __getnewargs__) so we can
+    reconstruct doc lookups from cache without re-running the full search.
+    Highlights are intentionally absent — they are generated per-page on
+    every request so only page_size docs are ever fetched from the doc store.
+    """
+
+    doc_address: tantivy.DocAddress
+    score: float
+    rank: int
+
+
+@dataclass(frozen=True, slots=True)
+class _AllHitsResult:
+    """Full ordered hit list — the unit stored in the search result cache.
+
+    Separating this from SearchResults lets us cache the ordering once and
+    generate page-scoped highlights cheaply on every request (cache hit or miss).
+    """
+
+    hits: list[_HitRecord]
+    total: int
+    query: str  # raw query, for SearchResults.query on the way out
 
 
 class TantivyRelevanceList:
@@ -468,14 +498,23 @@ class TantivyBackend:
         self._ensure_open()
 
         user_id = user.pk if user is not None else None
-
         tz = get_current_timezone()
+
         if search_mode is SearchMode.TEXT:
             user_query = parse_simple_text_query(self._index, query)
+            # TEXT/TITLE contain no date keywords — raw query is the correct cache key.
+            effective_query_key = query
         elif search_mode is SearchMode.TITLE:
             user_query = parse_simple_title_query(self._index, query)
+            effective_query_key = query
         else:
             user_query = parse_user_query(self._index, query, tz)
+            # QUERY mode rewrites relative date keywords (e.g. "today", "[-7 days to now]")
+            # to absolute ISO 8601 ranges at parse time.  Cache by the rewritten string so
+            # that "created:today" tomorrow does not return yesterday's cached results.
+            effective_query_key = normalize_query(
+                rewrite_natural_date_keywords(query, tz),
+            )
 
         # Apply permission filter if user is not None (not superuser)
         if user is not None:
@@ -489,8 +528,9 @@ class TantivyBackend:
         else:
             final_query = user_query
 
-        full_results = self._fetch_all_hits(
+        all_hits_result = self._fetch_all_hits(
             query,
+            effective_query_key,
             search_mode,
             user_id,
             final_query,
@@ -498,99 +538,25 @@ class TantivyBackend:
             sort_reverse=sort_reverse,
         )
 
-        # Slice the cached full hit list for the requested page
+        # Slice to the requested page and generate highlights for only those docs.
+        # Highlights are produced here (not in _fetch_all_hits) so that searcher.doc()
+        # and snippet generation are bounded by page_size, not _MAX_HITS.
         offset = (page - 1) * page_size
-        return SearchResults(
-            hits=full_results.hits[offset : offset + page_size],
-            total=full_results.total,
-            query=full_results.query,
-        )
-
-    def _fetch_all_hits(
-        self,
-        query: str,
-        search_mode: SearchMode,
-        user_id: int | None,
-        final_query: tantivy.Query,
-        sort_field: str | None,
-        *,
-        sort_reverse: bool,
-    ) -> SearchResults:
-        """Fetch, score, and build all matching hits for a query.
-
-        Results are cached keyed by (query, search_mode, user_id, sort_field,
-        sort_reverse) with no pagination parameters — the full hit list is stored
-        once and sliced per page by the caller.  This ensures any page request for
-        the same query is served from a single cache entry.
-        """
-        cached = get_search_results_cache(
-            query,
-            search_mode,
-            user_id,
-            sort_field,
-            sort_reverse=sort_reverse,
-        )
-        if cached is not None:
-            return cached
+        page_records = all_hits_result.hits[offset : offset + page_size]
 
         searcher = self._index.searcher()
-
-        # Map sort fields
-        sort_field_map = {
-            "title": "title_sort",
-            "correspondent__name": "correspondent_sort",
-            "document_type__name": "type_sort",
-            "created": "created",
-            "added": "added",
-            "modified": "modified",
-            "archive_serial_number": "asn",
-            "page_count": "page_count",
-            "num_notes": "num_notes",
-        }
-
-        # Fetch all hits up to the configured maximum
-        _MAX_HITS = 10_000
-        if sort_field and sort_field in sort_field_map:
-            mapped_field = sort_field_map[sort_field]
-            results = searcher.search(
-                final_query,
-                limit=_MAX_HITS,
-                order_by_field=mapped_field,
-                order=tantivy.Order.Desc if sort_reverse else tantivy.Order.Asc,
-            )
-            # Field sorting: hits are (score, DocAddress) tuples; score unused
-            all_hits = [(hit[1], 0.0) for hit in results.hits]
-        else:
-            # Score-based search: hits are (score, DocAddress) tuples
-            results = searcher.search(final_query, limit=_MAX_HITS)
-            all_hits = [(hit[1], hit[0]) for hit in results.hits]
-
-        total = results.count
-
-        # Normalize scores for score-based searches
-        if not sort_field and all_hits:
-            max_score = max(hit[1] for hit in all_hits) or 1.0
-            all_hits = [(hit[0], hit[1] / max_score) for hit in all_hits]
-
-        # Apply threshold filter if configured (score-based search only)
-        threshold = settings.ADVANCED_FUZZY_SEARCH_THRESHOLD
-        if threshold is not None and not sort_field:
-            all_hits = [hit for hit in all_hits if hit[1] >= threshold]
-
-        # Build SearchHit objects for every hit (highlights included)
         hits: list[SearchHit] = []
         snippet_generator = None
         notes_snippet_generator = None
 
-        for rank, (doc_address, score) in enumerate(all_hits, start=1):
-            actual_doc = searcher.doc(doc_address)
+        for record in page_records:
+            actual_doc = searcher.doc(record.doc_address)
             doc_dict = actual_doc.to_dict()
             doc_id = doc_dict["id"][0]
 
             highlights: dict[str, str] = {}
 
-            # Generate highlights if score > 0
-            if score > 0:
+            if record.score > 0:
                 try:
                     if snippet_generator is None:
                         snippet_generator = tantivy.SnippetGenerator.create(
@@ -604,7 +570,6 @@ class TantivyBackend:
                     if content_snippet:
                         highlights["content"] = str(content_snippet)
 
-                    # Try notes highlights
                     if "notes" in doc_dict:
                         if notes_snippet_generator is None:
                             notes_snippet_generator = tantivy.SnippetGenerator.create(
@@ -625,22 +590,110 @@ class TantivyBackend:
             hits.append(
                 SearchHit(
                     id=doc_id,
-                    score=score,
-                    rank=rank,
+                    score=record.score,
+                    rank=record.rank,
                     highlights=highlights,
                 ),
             )
 
-        full_results = SearchResults(hits=hits, total=total, query=query)
-        set_search_results_cache(
-            query,
+        return SearchResults(
+            hits=hits,
+            total=all_hits_result.total,
+            query=all_hits_result.query,
+        )
+
+    def _fetch_all_hits(
+        self,
+        query: str,
+        effective_query_key: str,
+        search_mode: str,
+        user_id: int | None,
+        final_query: tantivy.Query,
+        sort_field: str | None,
+        *,
+        sort_reverse: bool,
+    ) -> _AllHitsResult:
+        """Fetch and rank all matching hits, returning a lightweight cached result.
+
+        Stores only ``_HitRecord`` values (DocAddress + score + rank) — no
+        ``searcher.doc()`` calls and no snippet generation.  Highlights are
+        generated per-page by the caller so work is bounded by page_size.
+
+        Cache key uses ``effective_query_key`` (the date-rewritten, normalised
+        query for QUERY mode; the raw string for TEXT/TITLE) so that
+        time-relative queries like "created:today" are never served stale.
+
+        ``total`` is clamped to ``len(all_hits)`` after score/threshold
+        filtering so that pagination is consistent with the fetched hit cap.
+        """
+        cached: _AllHitsResult | None = get_search_results_cache(
+            effective_query_key,
             search_mode,
             user_id,
             sort_field,
             sort_reverse=sort_reverse,
-            results=full_results,
         )
-        return full_results
+        if cached is not None:
+            return cached
+
+        searcher = self._index.searcher()
+
+        _MAX_HITS = 10_000
+        sort_field_map = {
+            "title": "title_sort",
+            "correspondent__name": "correspondent_sort",
+            "document_type__name": "type_sort",
+            "created": "created",
+            "added": "added",
+            "modified": "modified",
+            "archive_serial_number": "asn",
+            "page_count": "page_count",
+            "num_notes": "num_notes",
+        }
+
+        if sort_field and sort_field in sort_field_map:
+            mapped_field = sort_field_map[sort_field]
+            results = searcher.search(
+                final_query,
+                limit=_MAX_HITS,
+                order_by_field=mapped_field,
+                order=tantivy.Order.Desc if sort_reverse else tantivy.Order.Asc,
+            )
+            all_hits = [(hit[1], 0.0) for hit in results.hits]
+        else:
+            results = searcher.search(final_query, limit=_MAX_HITS)
+            all_hits = [(hit[1], hit[0]) for hit in results.hits]
+
+        # Normalize scores for score-based searches
+        if not sort_field and all_hits:
+            max_score = max(hit[1] for hit in all_hits) or 1.0
+            all_hits = [(hit[0], hit[1] / max_score) for hit in all_hits]
+
+        # Apply threshold filter if configured (score-based search only)
+        threshold = settings.ADVANCED_FUZZY_SEARCH_THRESHOLD
+        if threshold is not None and not sort_field:
+            all_hits = [hit for hit in all_hits if hit[1] >= threshold]
+
+        # total is clamped to the number of hits we can actually serve.
+        # results.count may exceed _MAX_HITS; reporting it would produce empty
+        # pages beyond the cap while the UI shows a misleadingly large total.
+        total = len(all_hits)
+
+        hit_records = [
+            _HitRecord(doc_address=addr, score=score, rank=rank)
+            for rank, (addr, score) in enumerate(all_hits, start=1)
+        ]
+
+        result = _AllHitsResult(hits=hit_records, total=total, query=query)
+        set_search_results_cache(
+            effective_query_key,
+            search_mode,
+            user_id,
+            sort_field,
+            sort_reverse=sort_reverse,
+            results=result,
+        )
+        return result
 
     def autocomplete(
         self,

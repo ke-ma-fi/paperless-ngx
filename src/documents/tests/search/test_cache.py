@@ -8,14 +8,14 @@ from documents.caching import get_search_results_cache
 from documents.caching import set_search_results_cache
 from documents.models import Document
 from documents.search._backend import SearchMode
-from documents.search._backend import SearchResults
 from documents.search._backend import TantivyBackend
+from documents.search._backend import _AllHitsResult
 
 pytestmark = [pytest.mark.search, pytest.mark.django_db]
 
 
-def _make_results(query: str = "test") -> SearchResults:
-    return SearchResults(hits=[], total=0, query=query)
+def _make_cached(query: str = "test") -> _AllHitsResult:
+    return _AllHitsResult(hits=[], total=0, query=query)
 
 
 class TestSearchCacheFunctions:
@@ -32,7 +32,7 @@ class TestSearchCacheFunctions:
         assert result is None
 
     def test_set_then_get_returns_results(self) -> None:
-        results = _make_results("invoice")
+        results = _make_cached("invoice")
         set_search_results_cache(
             "invoice",
             "text",
@@ -51,8 +51,8 @@ class TestSearchCacheFunctions:
         assert cached == results
 
     def test_different_query_is_separate_entry(self) -> None:
-        r1 = _make_results("invoice")
-        r2 = _make_results("receipt")
+        r1 = _make_cached("invoice")
+        r2 = _make_cached("receipt")
         set_search_results_cache(
             "invoice",
             "text",
@@ -79,16 +79,16 @@ class TestSearchCacheFunctions:
         )
 
     def test_different_user_is_separate_entry(self) -> None:
-        r1 = _make_results()
-        r2 = _make_results()
+        r1 = _make_cached()
+        r2 = _make_cached()
         set_search_results_cache("q", "text", 1, None, sort_reverse=False, results=r1)
         set_search_results_cache("q", "text", 2, None, sort_reverse=False, results=r2)
         assert get_search_results_cache("q", "text", 1, None, sort_reverse=False) == r1
         assert get_search_results_cache("q", "text", 2, None, sort_reverse=False) == r2
 
     def test_superuser_none_is_separate_from_user(self) -> None:
-        r_super = _make_results("a")
-        r_user = _make_results("b")
+        r_super = _make_cached("a")
+        r_user = _make_cached("b")
         set_search_results_cache(
             "q",
             "text",
@@ -114,8 +114,8 @@ class TestSearchCacheFunctions:
         )
 
     def test_different_search_mode_is_separate_entry(self) -> None:
-        r_text = _make_results()
-        r_title = _make_results()
+        r_text = _make_cached()
+        r_title = _make_cached()
         set_search_results_cache(
             "q",
             "text",
@@ -141,7 +141,7 @@ class TestSearchCacheFunctions:
         )
 
     def test_bump_generation_invalidates_all_entries(self) -> None:
-        results = _make_results()
+        results = _make_cached()
         set_search_results_cache(
             "q",
             "text",
@@ -162,7 +162,7 @@ class TestSearchCacheFunctions:
         )
 
     def test_bump_generation_multiple_times(self) -> None:
-        results = _make_results()
+        results = _make_cached()
         set_search_results_cache(
             "q",
             "text",
@@ -242,7 +242,7 @@ class TestSearchCacheIntegration:
             sort_reverse=False,
         )
 
-        # Cache must hold the full hit list (not page-scoped).
+        # Cache holds _AllHitsResult (lightweight _HitRecord list, no highlights).
         cached = get_search_results_cache(
             "Invoice",
             SearchMode.QUERY,
@@ -252,9 +252,9 @@ class TestSearchCacheIntegration:
         )
         assert cached is not None
         assert cached.total == r1.total
-        assert cached.hits == r1.hits  # one doc, page_size=10 → same content
+        assert len(cached.hits) == len(r1.hits)  # one doc fits within page_size=10
 
-        # Second call must return identical results from cache.
+        # Second call must return the same ordering and totals from cache.
         r2 = backend.search(
             "Invoice",
             user=None,
@@ -263,7 +263,8 @@ class TestSearchCacheIntegration:
             sort_field=None,
             sort_reverse=False,
         )
-        assert r1 == r2
+        assert r1.total == r2.total
+        assert [h["id"] for h in r1.hits] == [h["id"] for h in r2.hits]
 
     def test_different_pages_served_from_single_cache_entry(
         self,
@@ -408,24 +409,85 @@ class TestSearchCacheIntegration:
             sort_reverse=False,
         )
 
-        # Both should be cached but under different keys.
-        assert (
-            get_search_results_cache(
-                "Shared",
-                SearchMode.QUERY,
-                None,
-                None,
-                sort_reverse=False,
-            )
-            == r_super
+        # Both should be cached under different keys (_AllHitsResult, not SearchResults).
+        cached_super = get_search_results_cache(
+            "Shared",
+            SearchMode.QUERY,
+            None,
+            None,
+            sort_reverse=False,
         )
+        cached_user = get_search_results_cache(
+            "Shared",
+            SearchMode.QUERY,
+            user.pk,
+            None,
+            sort_reverse=False,
+        )
+        assert cached_super is not None
+        assert cached_user is not None
+        assert cached_super.total == r_super.total
+        assert cached_user.total == r_user.total
+
+    def test_query_mode_uses_rewritten_key_not_raw_query(
+        self,
+        backend: TantivyBackend,
+    ) -> None:
+        """QUERY mode must cache under the date-rewritten key.
+
+        A raw query containing a relative date keyword ("today") is rewritten
+        to an absolute ISO 8601 range at parse time.  The cache must use the
+        rewritten key so that tomorrow's "created:today" request does not
+        return today's cached results.
+
+        We verify this by checking that the raw query string is NOT a cache key
+        while the rewritten key IS present after a search.
+        """
+        from django.utils.timezone import get_current_timezone
+
+        from documents.search._query import normalize_query
+        from documents.search._query import rewrite_natural_date_keywords
+
+        doc = Document.objects.create(
+            title="Daily Report",
+            content="today's figures",
+            checksum="DR1",
+            pk=5,
+        )
+        backend.add_or_update(doc)
+
+        raw_query = "created:today"
+        tz = get_current_timezone()
+        effective_key = normalize_query(rewrite_natural_date_keywords(raw_query, tz))
+
+        backend.search(
+            raw_query,
+            user=None,
+            page=1,
+            page_size=10,
+            sort_field=None,
+            sort_reverse=False,
+        )
+
+        # Raw query must NOT be in the cache (it was rewritten).
         assert (
             get_search_results_cache(
-                "Shared",
+                raw_query,
                 SearchMode.QUERY,
-                user.pk,
+                None,
                 None,
                 sort_reverse=False,
             )
-            == r_user
+            is None
+        )
+        # The rewritten key must be in the cache.
+        assert (
+            get_search_results_cache(
+                effective_key,
+                SearchMode.QUERY,
+                None,
+                None,
+                sort_reverse=False,
+            )
+            is not None
         )
