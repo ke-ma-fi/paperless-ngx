@@ -248,7 +248,8 @@ class TestSearch:
         a hyphen (e.g. "gs-N") correctly matches "Rechnungs-Nr."
 
         This was a known failure of the previous regex-based approach, which
-        used a regex tokenizer that split on punctuation.
+        operated on tokenized terms and could not match substrings spanning
+        punctuation boundaries.
         """
         doc = Document.objects.create(
             title="Rechnungs-Nr. 12345",
