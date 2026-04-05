@@ -135,6 +135,7 @@ class TestSearchCacheFunctions:
         assert (
             get_search_results_cache("q", "text", 1, None, sort_reverse=False) == r_text
         )
+        assert (
             get_search_results_cache("q", "title", 1, None, sort_reverse=False)
             == r_title
         )
