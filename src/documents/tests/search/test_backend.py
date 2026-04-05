@@ -197,8 +197,8 @@ class TestSearch:
 
         Searching "Z-Berichte 6" filters on the "z-berichte" trigrams only.
         All three documents match because they all contain "z-berichte" and
-        the single-char token "6" cannot be represented as a trigram.
-        This is the same behaviour as PostgreSQL's pg_trgm for short tokens.
+        the single-char token "6" cannot be represented as a trigram in this
+        backend.
         """
         exact_doc = Document.objects.create(
             title="Z-Berichte 6",
