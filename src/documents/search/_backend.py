@@ -21,6 +21,7 @@ from guardian.shortcuts import get_users_with_perms
 
 from documents.search._normalize import ascii_fold
 from documents.search._query import build_permission_filter
+from documents.search._query import get_simple_query_tokens
 from documents.search._query import parse_simple_text_query
 from documents.search._query import parse_simple_title_query
 from documents.search._query import parse_user_query
@@ -45,6 +46,12 @@ logger = logging.getLogger("paperless.search")
 _WORD_RE = regex.compile(r"\w+")
 _AUTOCOMPLETE_REGEX_TIMEOUT = 1.0  # seconds; guards against ReDoS on untrusted content
 
+# Maximum number of trigram candidates fetched from Tantivy before substring post-filtering.
+# Tantivy trigrams are a *candidate* filter; a document can contain every query trigram
+# scattered across the text without containing the query string as a connected substring.
+# We oversample relative to the requested page size so the post-filter never starves a page.
+_SIMPLE_SEARCH_MAX_FETCH = 10_000
+
 T = TypeVar("T")
 
 
@@ -52,6 +59,24 @@ class SearchMode(StrEnum):
     QUERY = "query"
     TEXT = "text"
     TITLE = "title"
+
+
+def _text_matches_tokens(text: str, tokens: list[str]) -> bool:
+    """Return True if every token appears as a contiguous substring in *text*.
+
+    Both *text* and the pre-normalized *tokens* are compared case-insensitively
+    after ASCII-folding so that accented characters match their base equivalents.
+    """
+    if not tokens:
+        return True
+    normalized = ascii_fold(text.lower())
+    return all(token in normalized for token in tokens)
+
+
+def _get_stored_field(doc_dict: dict, field: str) -> str:
+    """Return the first stored value for *field* from a Tantivy document dict, or ''."""
+    values = doc_dict.get(field)
+    return values[0] if values else ""
 
 
 def _extract_autocomplete_words(text_sources: list[str]) -> set[str]:
@@ -498,12 +523,17 @@ class TantivyBackend:
             "num_notes": "num_notes",
         }
 
+        # For simple text/title modes we oversample so that the substring post-filter
+        # (which eliminates scattered-trigram false positives) never starves a page.
+        is_simple_mode = search_mode in (SearchMode.TEXT, SearchMode.TITLE)
+        fetch_limit = _SIMPLE_SEARCH_MAX_FETCH if is_simple_mode else offset + page_size
+
         # Perform search
         if sort_field and sort_field in sort_field_map:
             mapped_field = sort_field_map[sort_field]
             results = searcher.search(
                 final_query,
-                limit=offset + page_size,
+                limit=fetch_limit,
                 order_by_field=mapped_field,
                 order=tantivy.Order.Desc if sort_reverse else tantivy.Order.Asc,
             )
@@ -511,12 +541,51 @@ class TantivyBackend:
             all_hits = [(hit[1], 0.0) for hit in results.hits]
         else:
             # Score-based search: hits are (score, DocAddress) tuples
-            results = searcher.search(final_query, limit=offset + page_size)
+            results = searcher.search(final_query, limit=fetch_limit)
             all_hits = [(hit[1], hit[0]) for hit in results.hits]
 
         total = results.count
 
+        # --- Substring post-filter (TEXT / TITLE modes only) ---
+        # Tantivy trigrams are a *candidate* approximation: a document can contain
+        # every query trigram scattered across different words without containing the
+        # query string as a contiguous substring.  We verify the actual substring
+        # presence here using the stored title/content fields (no DB round-trip needed).
+        #
+        # The fetched doc objects are kept in a parallel list so the result-building
+        # loop can reuse them without a second searcher.doc() call per page hit.
+        #
+        # NOTE: total after filtering reflects at most _SIMPLE_SEARCH_MAX_FETCH results.
+        # If the corpus has more true positives than that cap, the reported total and
+        # later pages will be silently truncated.  Increasing the cap is the mitigation.
+        filtered_docs: list[tantivy.Document] | None = None
+        if is_simple_mode:
+            tokens = get_simple_query_tokens(query)
+            if tokens:
+                filtered: list[tuple[tantivy.DocAddress, float]] = []
+                cached_docs: list[tantivy.Document] = []
+                for doc_address, score in all_hits:
+                    doc_obj = searcher.doc(doc_address)
+                    doc_dict = doc_obj.to_dict()
+                    title = _get_stored_field(doc_dict, "title")
+                    content = _get_stored_field(doc_dict, "content")
+                    if search_mode == SearchMode.TITLE:
+                        keep = _text_matches_tokens(title, tokens)
+                    else:
+                        # TEXT mode: tokens must all appear in title *or* all in content
+                        keep = _text_matches_tokens(title, tokens) or _text_matches_tokens(
+                            content,
+                            tokens,
+                        )
+                    if keep:
+                        filtered.append((doc_address, score))
+                        cached_docs.append(doc_obj)
+                all_hits = filtered
+                filtered_docs = cached_docs
+                total = len(all_hits)
+
         # Normalize scores for score-based searches
+        # filtered_docs stays parallel to all_hits through this — only scores change.
         if not sort_field and all_hits:
             max_score = max(hit[1] for hit in all_hits) or 1.0
             all_hits = [(hit[0], hit[1] / max_score) for hit in all_hits]
@@ -524,19 +593,31 @@ class TantivyBackend:
         # Apply threshold filter if configured (score-based search only)
         threshold = settings.ADVANCED_FUZZY_SEARCH_THRESHOLD
         if threshold is not None and not sort_field:
-            all_hits = [hit for hit in all_hits if hit[1] >= threshold]
+            if filtered_docs is not None:
+                pairs = [
+                    (hit, doc)
+                    for hit, doc in zip(all_hits, filtered_docs)
+                    if hit[1] >= threshold
+                ]
+                all_hits = [p[0] for p in pairs]
+                filtered_docs = [p[1] for p in pairs]
+            else:
+                all_hits = [hit for hit in all_hits if hit[1] >= threshold]
 
         # Get the page's hits
         page_hits = all_hits[offset : offset + page_size]
+        page_docs = filtered_docs[offset : offset + page_size] if filtered_docs is not None else None
 
         # Build result hits with highlights
         hits: list[SearchHit] = []
         snippet_generator = None
         notes_snippet_generator = None
 
-        for rank, (doc_address, score) in enumerate(page_hits, start=offset + 1):
-            # Get the actual document from the searcher using the doc address
-            actual_doc = searcher.doc(doc_address)
+        for page_idx, (doc_address, score) in enumerate(page_hits):
+            rank = page_idx + offset + 1
+            # Reuse cached doc from the post-filter pass when available to avoid a
+            # second searcher.doc() call for the same document.
+            actual_doc = page_docs[page_idx] if page_docs is not None else searcher.doc(doc_address)
             doc_dict = actual_doc.to_dict()
             doc_id = doc_dict["id"][0]
 
