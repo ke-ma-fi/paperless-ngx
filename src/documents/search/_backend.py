@@ -468,15 +468,6 @@ class TantivyBackend:
         self._ensure_open()
 
         user_id = user.pk if user is not None else None
-        cached = get_search_results_cache(
-            query,
-            search_mode,
-            user_id,
-            sort_field,
-            sort_reverse=sort_reverse,
-        )
-        if cached is not None:
-            return cached
 
         tz = get_current_timezone()
         if search_mode is SearchMode.TEXT:
@@ -498,8 +489,51 @@ class TantivyBackend:
         else:
             final_query = user_query
 
-        searcher = self._index.searcher()
+        full_results = self._fetch_all_hits(
+            query,
+            search_mode,
+            user_id,
+            final_query,
+            sort_field,
+            sort_reverse=sort_reverse,
+        )
+
+        # Slice the cached full hit list for the requested page
         offset = (page - 1) * page_size
+        return SearchResults(
+            hits=full_results.hits[offset : offset + page_size],
+            total=full_results.total,
+            query=full_results.query,
+        )
+
+    def _fetch_all_hits(
+        self,
+        query: str,
+        search_mode: str,
+        user_id: int | None,
+        final_query: tantivy.Query,
+        sort_field: str | None,
+        *,
+        sort_reverse: bool,
+    ) -> SearchResults:
+        """Fetch, score, and build all matching hits for a query.
+
+        Results are cached keyed by (query, search_mode, user_id, sort_field,
+        sort_reverse) with no pagination parameters — the full hit list is stored
+        once and sliced per page by the caller.  This ensures any page request for
+        the same query is served from a single cache entry.
+        """
+        cached = get_search_results_cache(
+            query,
+            search_mode,
+            user_id,
+            sort_field,
+            sort_reverse=sort_reverse,
+        )
+        if cached is not None:
+            return cached
+
+        searcher = self._index.searcher()
 
         # Map sort fields
         sort_field_map = {
@@ -514,20 +548,21 @@ class TantivyBackend:
             "num_notes": "num_notes",
         }
 
-        # Perform search
+        # Fetch all hits up to the configured maximum
+        _MAX_HITS = 10_000
         if sort_field and sort_field in sort_field_map:
             mapped_field = sort_field_map[sort_field]
             results = searcher.search(
                 final_query,
-                limit=offset + page_size,
+                limit=_MAX_HITS,
                 order_by_field=mapped_field,
                 order=tantivy.Order.Desc if sort_reverse else tantivy.Order.Asc,
             )
-            # Field sorting: hits are still (score, DocAddress) tuples; score unused
+            # Field sorting: hits are (score, DocAddress) tuples; score unused
             all_hits = [(hit[1], 0.0) for hit in results.hits]
         else:
             # Score-based search: hits are (score, DocAddress) tuples
-            results = searcher.search(final_query, limit=offset + page_size)
+            results = searcher.search(final_query, limit=_MAX_HITS)
             all_hits = [(hit[1], hit[0]) for hit in results.hits]
 
         total = results.count
@@ -542,16 +577,12 @@ class TantivyBackend:
         if threshold is not None and not sort_field:
             all_hits = [hit for hit in all_hits if hit[1] >= threshold]
 
-        # Get the page's hits
-        page_hits = all_hits[offset : offset + page_size]
-
-        # Build result hits with highlights
+        # Build SearchHit objects for every hit (highlights included)
         hits: list[SearchHit] = []
         snippet_generator = None
         notes_snippet_generator = None
 
-        for rank, (doc_address, score) in enumerate(page_hits, start=offset + 1):
-            # Get the actual document from the searcher using the doc address
+        for rank, (doc_address, score) in enumerate(all_hits, start=1):
             actual_doc = searcher.doc(doc_address)
             doc_dict = actual_doc.to_dict()
             doc_id = doc_dict["id"][0]
@@ -600,20 +631,16 @@ class TantivyBackend:
                 ),
             )
 
-        search_results = SearchResults(
-            hits=hits,
-            total=total,
-            query=query,
-        )
+        full_results = SearchResults(hits=hits, total=total, query=query)
         set_search_results_cache(
             query,
             search_mode,
             user_id,
             sort_field,
             sort_reverse=sort_reverse,
-            results=search_results,
+            results=full_results,
         )
-        return search_results
+        return full_results
 
     def autocomplete(
         self,

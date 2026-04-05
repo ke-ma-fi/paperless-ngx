@@ -208,7 +208,7 @@ class TestSearchCacheIntegration:
             sort_reverse=False,
         )
 
-        # Cache must now hold the result.
+        # Cache must hold the full hit list (not page-scoped).
         cached = get_search_results_cache(
             "Invoice",
             SearchMode.QUERY,
@@ -216,9 +216,11 @@ class TestSearchCacheIntegration:
             None,
             sort_reverse=False,
         )
-        assert cached == r1
+        assert cached is not None
+        assert cached.total == r1.total
+        assert cached.hits == r1.hits  # one doc, page_size=10 → same content
 
-        # Second call must return the same result from cache.
+        # Second call must return identical results from cache.
         r2 = backend.search(
             "Invoice",
             user=None,
@@ -228,6 +230,47 @@ class TestSearchCacheIntegration:
             sort_reverse=False,
         )
         assert r1 == r2
+
+    def test_different_pages_served_from_single_cache_entry(
+        self,
+        backend: TantivyBackend,
+    ) -> None:
+        """All pages of the same query must be served from one cache entry."""
+        for i in range(1, 6):
+            Document.objects.create(
+                title=f"Report {i}",
+                content="quarterly data",
+                checksum=f"RPT{i}",
+                pk=100 + i,
+            )
+            backend.add_or_update(Document.objects.get(pk=100 + i))
+
+        # Page 1 populates cache.
+        p1 = backend.search(
+            "Report",
+            user=None,
+            page=1,
+            page_size=2,
+            sort_field=None,
+            sort_reverse=False,
+        )
+        # Page 2 must be served from the same cache entry.
+        p2 = backend.search(
+            "Report",
+            user=None,
+            page=2,
+            page_size=2,
+            sort_field=None,
+            sort_reverse=False,
+        )
+
+        # Results must be different slices, not the same page repeated.
+        assert p1.total == p2.total == 5
+        assert len(p1.hits) == 2
+        assert len(p2.hits) == 2
+        p1_ids = {h["id"] for h in p1.hits}
+        p2_ids = {h["id"] for h in p2.hits}
+        assert p1_ids.isdisjoint(p2_ids), "page 1 and page 2 must not overlap"
 
     def test_add_or_update_invalidates_cache(self, backend: TantivyBackend) -> None:
         doc = Document.objects.create(
