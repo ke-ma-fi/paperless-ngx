@@ -118,11 +118,12 @@ def _bigram_analyzer() -> tantivy.TextAnalyzer:
 
 
 def _trigram_analyzer() -> tantivy.TextAnalyzer:
-    """Enables trigram-based substring search: ngram(3,3) -> lowercase. No word splitting — trigrams span punctuation and spaces."""
+    """Enables trigram-based substring search: ngram(3,3) -> lowercase -> ascii_fold. No word splitting — trigrams span punctuation and spaces."""
     return (
         tantivy.TextAnalyzerBuilder(
             tantivy.Tokenizer.ngram(min_gram=3, max_gram=3, prefix_only=False),
         )
         .filter(tantivy.Filter.lowercase())
+        .filter(tantivy.Filter.ascii_fold())
         .build()
     )
