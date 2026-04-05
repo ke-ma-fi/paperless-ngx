@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("paperless.search")
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def build_schema() -> tantivy.Schema:
@@ -53,16 +53,19 @@ def build_schema() -> tantivy.Schema:
     # CJK support - not stored, indexed only
     sb.add_text_field("bigram_content", stored=False, tokenizer_name="bigram_analyzer")
 
-    # Simple substring search support for title/content - not stored, indexed only
+    # Simple substring search support for title/content - not stored, indexed only.
+    # Text is pre-processed in Python (word_trigrams_text) into space-separated
+    # per-word trigrams before indexing. The whitespace tokenizer preserves
+    # sequential positions so phrase_query can enforce consecutive trigrams.
     sb.add_text_field(
         "simple_title",
         stored=False,
-        tokenizer_name="trigram_analyzer",
+        tokenizer_name="whitespace",
     )
     sb.add_text_field(
         "simple_content",
         stored=False,
-        tokenizer_name="trigram_analyzer",
+        tokenizer_name="whitespace",
     )
 
     # Autocomplete prefix scan - stored, not indexed

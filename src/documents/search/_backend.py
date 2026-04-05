@@ -20,6 +20,7 @@ from django.utils.timezone import get_current_timezone
 from guardian.shortcuts import get_users_with_perms
 
 from documents.search._normalize import ascii_fold
+from documents.search._normalize import word_trigrams_text
 from documents.search._query import build_permission_filter
 from documents.search._query import parse_simple_text_query
 from documents.search._query import parse_simple_title_query
@@ -293,10 +294,10 @@ class TantivyBackend:
         doc.add_text("checksum", document.checksum)
         doc.add_text("title", document.title)
         doc.add_text("title_sort", document.title)
-        doc.add_text("simple_title", document.title)
+        doc.add_text("simple_title", word_trigrams_text(document.title))
         doc.add_text("content", content)
         doc.add_text("bigram_content", content)
-        doc.add_text("simple_content", content)
+        doc.add_text("simple_content", word_trigrams_text(content))
 
         # Original filename - only add if not None/empty
         if document.original_filename:
