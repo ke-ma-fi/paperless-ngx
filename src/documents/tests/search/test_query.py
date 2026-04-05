@@ -563,13 +563,12 @@ class TestGetSimpleQueryTokens:
 
         assert get_simple_query_tokens("") == []
 
-    def test_symbol_only_query_returns_empty_list(self) -> None:
+    def test_symbol_only_token_of_length_3_is_included(self) -> None:
         from documents.search._query import get_simple_query_tokens
 
-        # "!!!" has no alphanumeric chars but is 3 chars — still no trigrams (it's not
-        # filtered by length, but it won't generate meaningful matches anyway)
+        # "!!!" has length 3 so it passes the length filter and is returned.
+        # The function filters on length only, not character class.
         result = get_simple_query_tokens("!!!")
-        # The token "!!!" has length 3, so it IS returned (not filtered by length)
         assert result == ["!!!"]
 
     def test_exactly_three_chars_included(self) -> None:

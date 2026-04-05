@@ -551,10 +551,19 @@ class TantivyBackend:
         # every query trigram scattered across different words without containing the
         # query string as a contiguous substring.  We verify the actual substring
         # presence here using the stored title/content fields (no DB round-trip needed).
+        #
+        # The fetched doc objects are kept in a parallel list so the result-building
+        # loop can reuse them without a second searcher.doc() call per page hit.
+        #
+        # NOTE: total after filtering reflects at most _SIMPLE_SEARCH_MAX_FETCH results.
+        # If the corpus has more true positives than that cap, the reported total and
+        # later pages will be silently truncated.  Increasing the cap is the mitigation.
+        filtered_docs: list[tantivy.Document] | None = None
         if is_simple_mode:
             tokens = get_simple_query_tokens(query)
             if tokens:
                 filtered: list[tuple[tantivy.DocAddress, float]] = []
+                cached_docs: list[tantivy.Document] = []
                 for doc_address, score in all_hits:
                     doc_obj = searcher.doc(doc_address)
                     doc_dict = doc_obj.to_dict()
@@ -570,10 +579,13 @@ class TantivyBackend:
                         )
                     if keep:
                         filtered.append((doc_address, score))
+                        cached_docs.append(doc_obj)
                 all_hits = filtered
+                filtered_docs = cached_docs
                 total = len(all_hits)
 
         # Normalize scores for score-based searches
+        # filtered_docs stays parallel to all_hits through this — only scores change.
         if not sort_field and all_hits:
             max_score = max(hit[1] for hit in all_hits) or 1.0
             all_hits = [(hit[0], hit[1] / max_score) for hit in all_hits]
@@ -581,19 +593,31 @@ class TantivyBackend:
         # Apply threshold filter if configured (score-based search only)
         threshold = settings.ADVANCED_FUZZY_SEARCH_THRESHOLD
         if threshold is not None and not sort_field:
-            all_hits = [hit for hit in all_hits if hit[1] >= threshold]
+            if filtered_docs is not None:
+                pairs = [
+                    (hit, doc)
+                    for hit, doc in zip(all_hits, filtered_docs)
+                    if hit[1] >= threshold
+                ]
+                all_hits = [p[0] for p in pairs]
+                filtered_docs = [p[1] for p in pairs]
+            else:
+                all_hits = [hit for hit in all_hits if hit[1] >= threshold]
 
         # Get the page's hits
         page_hits = all_hits[offset : offset + page_size]
+        page_docs = filtered_docs[offset : offset + page_size] if filtered_docs is not None else None
 
         # Build result hits with highlights
         hits: list[SearchHit] = []
         snippet_generator = None
         notes_snippet_generator = None
 
-        for rank, (doc_address, score) in enumerate(page_hits, start=offset + 1):
-            # Get the actual document from the searcher using the doc address
-            actual_doc = searcher.doc(doc_address)
+        for page_idx, (doc_address, score) in enumerate(page_hits):
+            rank = page_idx + offset + 1
+            # Reuse cached doc from the post-filter pass when available to avoid a
+            # second searcher.doc() call for the same document.
+            actual_doc = page_docs[page_idx] if page_docs is not None else searcher.doc(doc_address)
             doc_dict = actual_doc.to_dict()
             doc_id = doc_dict["id"][0]
 
