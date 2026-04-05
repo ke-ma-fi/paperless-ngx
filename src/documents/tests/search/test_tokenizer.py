@@ -95,8 +95,18 @@ class TestTokenizers:
         # "sswo" → trigrams: ssw, swo — both must be present
         q = tantivy.Query.boolean_query(
             [
-                (tantivy.Occur.Must, tantivy.Query.term_query(simple_search_index.schema, "simple_content", "ssw")),
-                (tantivy.Occur.Must, tantivy.Query.term_query(simple_search_index.schema, "simple_content", "swo")),
+                (
+                    tantivy.Occur.Must,
+                    tantivy.Query.term_query(
+                        simple_search_index.schema, "simple_content", "ssw"
+                    ),
+                ),
+                (
+                    tantivy.Occur.Must,
+                    tantivy.Query.term_query(
+                        simple_search_index.schema, "simple_content", "swo"
+                    ),
+                ),
             ],
         )
         assert simple_search_index.searcher().search(q, limit=5).count == 1

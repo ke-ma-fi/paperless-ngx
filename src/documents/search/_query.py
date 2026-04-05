@@ -465,7 +465,11 @@ def _build_trigram_field_query(
         (tantivy.Occur.Must, tantivy.Query.term_query(index.schema, field, tgm))
         for tgm in all_trigrams
     ]
-    q = tantivy.Query.boolean_query(subqueries) if len(subqueries) > 1 else subqueries[0][1]
+    q = (
+        tantivy.Query.boolean_query(subqueries)
+        if len(subqueries) > 1
+        else subqueries[0][1]
+    )
 
     boost = _SIMPLE_FIELD_BOOSTS.get(field, 1.0)
     if boost > 1.0:
