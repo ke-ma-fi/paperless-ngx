@@ -73,6 +73,12 @@ def _text_matches_tokens(text: str, tokens: list[str]) -> bool:
     return all(token in normalized for token in tokens)
 
 
+def _get_stored_field(doc_dict: dict, field: str) -> str:
+    """Return the first stored value for *field* from a Tantivy document dict, or ''."""
+    values = doc_dict.get(field)
+    return values[0] if values else ""
+
+
 def _extract_autocomplete_words(text_sources: list[str]) -> set[str]:
     """Extract and normalize words for autocomplete.
 
@@ -552,9 +558,9 @@ class TantivyBackend:
                 for doc_address, score in all_hits:
                     doc_obj = searcher.doc(doc_address)
                     doc_dict = doc_obj.to_dict()
-                    title = (doc_dict.get("title") or [""])[0]
-                    content = (doc_dict.get("content") or [""])[0]
-                    if search_mode is SearchMode.TITLE:
+                    title = _get_stored_field(doc_dict, "title")
+                    content = _get_stored_field(doc_dict, "content")
+                    if search_mode == SearchMode.TITLE:
                         keep = _text_matches_tokens(title, tokens)
                     else:
                         # TEXT mode: tokens must all appear in title *or* all in content
