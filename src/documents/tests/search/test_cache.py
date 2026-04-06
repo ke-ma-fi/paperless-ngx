@@ -8,14 +8,14 @@ from documents.caching import get_search_results_cache
 from documents.caching import set_search_results_cache
 from documents.models import Document
 from documents.search._backend import SearchMode
+from documents.search._backend import SearchResults
 from documents.search._backend import TantivyBackend
-from documents.search._backend import _AllHitsResult
 
 pytestmark = [pytest.mark.search, pytest.mark.django_db]
 
 
-def _make_cached(query: str = "test") -> _AllHitsResult:
-    return _AllHitsResult(hits=[], total=0, query=query)
+def _make_cached(query: str = "test") -> SearchResults:
+    return SearchResults(hits=[], total=0, query=query)
 
 
 class TestSearchCacheFunctions:
@@ -242,7 +242,7 @@ class TestSearchCacheIntegration:
             sort_reverse=False,
         )
 
-        # Cache holds _AllHitsResult (lightweight _HitRecord list, no highlights).
+        # Cache holds SearchResults (pure Python types — safely picklable).
         cached = get_search_results_cache(
             "Invoice",
             SearchMode.QUERY,
@@ -409,7 +409,7 @@ class TestSearchCacheIntegration:
             sort_reverse=False,
         )
 
-        # Both should be cached under different keys (_AllHitsResult, not SearchResults).
+        # Both should be cached under different keys (one per user).
         cached_super = get_search_results_cache(
             "Shared",
             SearchMode.QUERY,

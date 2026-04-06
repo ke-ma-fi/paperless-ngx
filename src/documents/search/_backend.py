@@ -109,33 +109,6 @@ class SearchResults:
     query: str  # preprocessed query string
 
 
-@dataclass(frozen=True, slots=True)
-class _HitRecord:
-    """Lightweight per-hit record stored in the search cache.
-
-    Uses tantivy.DocAddress (picklable via __getnewargs__) so we can
-    reconstruct doc lookups from cache without re-running the full search.
-    Highlights are intentionally absent — they are generated per-page on
-    every request so only page_size docs are ever fetched from the doc store.
-    """
-
-    doc_address: tantivy.DocAddress
-    score: float
-    rank: int
-
-
-@dataclass(frozen=True, slots=True)
-class _AllHitsResult:
-    """Full ordered hit list — the unit stored in the search result cache.
-
-    Separating this from SearchResults lets us cache the ordering once and
-    generate page-scoped highlights cheaply on every request (cache hit or miss).
-    """
-
-    hits: list[_HitRecord]
-    total: int
-    query: str  # raw query, for SearchResults.query on the way out
-
 
 class TantivyRelevanceList:
     """
@@ -528,7 +501,7 @@ class TantivyBackend:
         else:
             final_query = user_query
 
-        all_hits_result = self._fetch_all_hits(
+        full_results = self._fetch_all_hits(
             query,
             effective_query_key,
             search_mode,
@@ -538,68 +511,13 @@ class TantivyBackend:
             sort_reverse=sort_reverse,
         )
 
-        # Slice to the requested page and generate highlights for only those docs.
-        # Highlights are produced here (not in _fetch_all_hits) so that searcher.doc()
-        # and snippet generation are bounded by page_size, not _MAX_HITS.
+        # Slice the cached full hit list for the requested page.
+        # On a cache hit this is the only work done — zero tantivy calls.
         offset = (page - 1) * page_size
-        page_records = all_hits_result.hits[offset : offset + page_size]
-
-        searcher = self._index.searcher()
-        hits: list[SearchHit] = []
-        snippet_generator = None
-        notes_snippet_generator = None
-
-        for record in page_records:
-            actual_doc = searcher.doc(record.doc_address)
-            doc_dict = actual_doc.to_dict()
-            doc_id = doc_dict["id"][0]
-
-            highlights: dict[str, str] = {}
-
-            if record.score > 0:
-                try:
-                    if snippet_generator is None:
-                        snippet_generator = tantivy.SnippetGenerator.create(
-                            searcher,
-                            final_query,
-                            self._schema,
-                            "content",
-                        )
-
-                    content_snippet = snippet_generator.snippet_from_doc(actual_doc)
-                    if content_snippet:
-                        highlights["content"] = str(content_snippet)
-
-                    if "notes" in doc_dict:
-                        if notes_snippet_generator is None:
-                            notes_snippet_generator = tantivy.SnippetGenerator.create(
-                                searcher,
-                                final_query,
-                                self._schema,
-                                "notes",
-                            )
-                        notes_snippet = notes_snippet_generator.snippet_from_doc(
-                            actual_doc,
-                        )
-                        if notes_snippet:
-                            highlights["notes"] = str(notes_snippet)
-
-                except Exception:  # pragma: no cover
-                    logger.debug("Failed to generate highlights for doc %s", doc_id)
-
-            hits.append(
-                SearchHit(
-                    id=doc_id,
-                    score=record.score,
-                    rank=record.rank,
-                    highlights=highlights,
-                ),
-            )
-
         return SearchResults(
-            hits=hits,
-            total=all_hits_result.total,
-            query=all_hits_result.query,
+            hits=full_results.hits[offset : offset + page_size],
+            total=full_results.total,
+            query=full_results.query,
         )
 
     def _fetch_all_hits(
@@ -612,21 +530,22 @@ class TantivyBackend:
         sort_field: str | None,
         *,
         sort_reverse: bool,
-    ) -> _AllHitsResult:
-        """Fetch and rank all matching hits, returning a lightweight cached result.
+    ) -> SearchResults:
+        """Fetch, score, and build all matching hits for a query.
 
-        Stores only ``_HitRecord`` values (DocAddress + score + rank) — no
-        ``searcher.doc()`` calls and no snippet generation.  Highlights are
-        generated per-page by the caller so work is bounded by page_size.
+        Results are cached keyed by (effective_query_key, search_mode, user_id,
+        sort_field, sort_reverse) with no pagination parameters — the full hit
+        list is stored once and sliced per page by the caller.  A cache hit
+        therefore costs only a list slice with zero tantivy calls.
 
-        Cache key uses ``effective_query_key`` (the date-rewritten, normalised
-        query for QUERY mode; the raw string for TEXT/TITLE) so that
-        time-relative queries like "created:today" are never served stale.
+        ``effective_query_key`` is the date-rewritten, normalised query for
+        QUERY mode (so "created:today" always maps to today's ISO range, never
+        returning yesterday's cached results) and the raw string for TEXT/TITLE.
 
         ``total`` is clamped to ``len(all_hits)`` after score/threshold
         filtering so that pagination is consistent with the fetched hit cap.
         """
-        cached: _AllHitsResult | None = get_search_results_cache(
+        cached: SearchResults | None = get_search_results_cache(
             effective_query_key,
             search_mode,
             user_id,
@@ -659,8 +578,10 @@ class TantivyBackend:
                 order_by_field=mapped_field,
                 order=tantivy.Order.Desc if sort_reverse else tantivy.Order.Asc,
             )
+            # Field sorting: hits are (score, DocAddress) tuples; score unused
             all_hits = [(hit[1], 0.0) for hit in results.hits]
         else:
+            # Score-based search: hits are (score, DocAddress) tuples
             results = searcher.search(final_query, limit=_MAX_HITS)
             all_hits = [(hit[1], hit[0]) for hit in results.hits]
 
@@ -679,21 +600,72 @@ class TantivyBackend:
         # pages beyond the cap while the UI shows a misleadingly large total.
         total = len(all_hits)
 
-        hit_records = [
-            _HitRecord(doc_address=addr, score=score, rank=rank)
-            for rank, (addr, score) in enumerate(all_hits, start=1)
-        ]
+        # Build SearchHit objects for every hit (highlights included).
+        # All field types are plain Python (int, float, str, dict) — safely
+        # picklable for Redis and any other Django cache backend.
+        hits: list[SearchHit] = []
+        snippet_generator = None
+        notes_snippet_generator = None
 
-        result = _AllHitsResult(hits=hit_records, total=total, query=query)
+        for rank, (doc_address, score) in enumerate(all_hits, start=1):
+            actual_doc = searcher.doc(doc_address)
+            doc_dict = actual_doc.to_dict()
+            doc_id = doc_dict["id"][0]
+
+            highlights: dict[str, str] = {}
+
+            # Generate highlights if score > 0
+            if score > 0:
+                try:
+                    if snippet_generator is None:
+                        snippet_generator = tantivy.SnippetGenerator.create(
+                            searcher,
+                            final_query,
+                            self._schema,
+                            "content",
+                        )
+
+                    content_snippet = snippet_generator.snippet_from_doc(actual_doc)
+                    if content_snippet:
+                        highlights["content"] = str(content_snippet)
+
+                    # Try notes highlights
+                    if "notes" in doc_dict:
+                        if notes_snippet_generator is None:
+                            notes_snippet_generator = tantivy.SnippetGenerator.create(
+                                searcher,
+                                final_query,
+                                self._schema,
+                                "notes",
+                            )
+                        notes_snippet = notes_snippet_generator.snippet_from_doc(
+                            actual_doc,
+                        )
+                        if notes_snippet:
+                            highlights["notes"] = str(notes_snippet)
+
+                except Exception:  # pragma: no cover
+                    logger.debug("Failed to generate highlights for doc %s", doc_id)
+
+            hits.append(
+                SearchHit(
+                    id=doc_id,
+                    score=score,
+                    rank=rank,
+                    highlights=highlights,
+                ),
+            )
+
+        full_results = SearchResults(hits=hits, total=total, query=query)
         set_search_results_cache(
             effective_query_key,
             search_mode,
             user_id,
             sort_field,
             sort_reverse=sort_reverse,
-            results=result,
+            results=full_results,
         )
-        return result
+        return full_results
 
     def autocomplete(
         self,

@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from django.core.cache.backends.base import BaseCache
 
     from documents.classifier import DocumentClassifier
+    from documents.search._backend import SearchResults
 
 logger = logging.getLogger("paperless.caching")
 
@@ -403,13 +404,8 @@ def get_search_results_cache(
     sort_field: str | None,
     *,
     sort_reverse: bool,
-) -> Any | None:
-    """Return the cached search hit list for the given parameters, or None on a miss.
-
-    The stored value is an ``_AllHitsResult`` instance (defined in
-    ``documents.search._backend``).  The type is ``Any`` here to avoid a
-    circular import; callers are responsible for interpreting the value.
-    """
+) -> SearchResults | None:
+    """Return cached SearchResults for the given parameters, or None on a miss."""
     key = _search_cache_key(
         query,
         search_mode,
@@ -427,9 +423,9 @@ def set_search_results_cache(
     sort_field: str | None,
     *,
     sort_reverse: bool,
-    results: Any,
+    results: SearchResults,
 ) -> None:
-    """Store a search hit list (``_AllHitsResult``) in the cache."""
+    """Store SearchResults in the cache."""
     key = _search_cache_key(
         query,
         search_mode,
