@@ -101,13 +101,12 @@ class SearchResults:
     Attributes:
         hits: List of search results with scores and highlights
         total: Total matching documents across all pages (for pagination)
-        query: Preprocessed query string after date/syntax rewriting
+        query: Raw query string as entered by the user
     """
 
     hits: list[SearchHit]
     total: int  # total matching documents (for pagination)
-    query: str  # preprocessed query string
-
+    query: str  # raw query string as entered by the user
 
 
 class TantivyRelevanceList:
@@ -466,7 +465,7 @@ class TantivyBackend:
                 plain-text search over title only
 
         Returns:
-            SearchResults with hits, total count, and processed query
+            SearchResults with hits, total count, and the raw query string
         """
         self._ensure_open()
 
@@ -475,16 +474,20 @@ class TantivyBackend:
 
         if search_mode is SearchMode.TEXT:
             user_query = parse_simple_text_query(self._index, query)
-            # TEXT/TITLE contain no date keywords — raw query is the correct cache key.
-            effective_query_key = query
+            # TEXT/TITLE are plain-text searches — tantivy lowercases tokens, so
+            # "Rechnung" and "rechnung" return identical results.  Lowercase the
+            # key so both map to the same cache entry.
+            effective_query_key = query.lower()
         elif search_mode is SearchMode.TITLE:
             user_query = parse_simple_title_query(self._index, query)
-            effective_query_key = query
+            effective_query_key = query.lower()
         else:
             user_query = parse_user_query(self._index, query, tz)
             # QUERY mode rewrites relative date keywords (e.g. "today", "[-7 days to now]")
             # to absolute ISO 8601 ranges at parse time.  Cache by the rewritten string so
             # that "created:today" tomorrow does not return yesterday's cached results.
+            # We do not lowercase here because boolean operators (AND, OR, NOT) are
+            # case-sensitive in tantivy's query parser.
             effective_query_key = normalize_query(
                 rewrite_natural_date_keywords(query, tz),
             )
@@ -511,8 +514,7 @@ class TantivyBackend:
             sort_reverse=sort_reverse,
         )
 
-        # Slice the cached full hit list for the requested page.
-        # On a cache hit this is the only work done — zero tantivy calls.
+        # Cache hit path: slice only — zero tantivy calls.
         offset = (page - 1) * page_size
         return SearchResults(
             hits=full_results.hits[offset : offset + page_size],
@@ -535,15 +537,25 @@ class TantivyBackend:
 
         Results are cached keyed by (effective_query_key, search_mode, user_id,
         sort_field, sort_reverse) with no pagination parameters — the full hit
-        list is stored once and sliced per page by the caller.  A cache hit
-        therefore costs only a list slice with zero tantivy calls.
+        list including precomputed highlights is stored once and sliced per page
+        by the caller.
 
-        ``effective_query_key`` is the date-rewritten, normalised query for
-        QUERY mode (so "created:today" always maps to today's ISO range, never
-        returning yesterday's cached results) and the raw string for TEXT/TITLE.
+        Highlights are generated here, not in ``search()``, because
+        ``SnippetGenerator.create()`` is the expensive step — it loads posting
+        lists for all query terms across every segment regardless of how many
+        docs you ultimately call ``snippet_from_doc()`` on.  Paying that cost
+        once on cache miss and storing the result strings means cache hits are a
+        free list slice with zero tantivy work.
 
-        ``total`` is clamped to ``len(all_hits)`` after score/threshold
-        filtering so that pagination is consistent with the fetched hit cap.
+        All stored field types are plain Python (int, float, str, dict) — safely
+        picklable by Redis or any other Django cache backend.
+
+        ``effective_query_key`` ensures QUERY mode date expressions like
+        "created:today" resolve to an absolute ISO range and never return stale
+        results across day boundaries.
+
+        ``total`` is clamped to ``len(all_hits)`` after filtering so pagination
+        stays consistent with the hard ``_MAX_HITS`` cap.
         """
         cached: SearchResults | None = get_search_results_cache(
             effective_query_key,
@@ -600,9 +612,6 @@ class TantivyBackend:
         # pages beyond the cap while the UI shows a misleadingly large total.
         total = len(all_hits)
 
-        # Build SearchHit objects for every hit (highlights included).
-        # All field types are plain Python (int, float, str, dict) — safely
-        # picklable for Redis and any other Django cache backend.
         hits: list[SearchHit] = []
         snippet_generator = None
         notes_snippet_generator = None
@@ -614,7 +623,6 @@ class TantivyBackend:
 
             highlights: dict[str, str] = {}
 
-            # Generate highlights if score > 0
             if score > 0:
                 try:
                     if snippet_generator is None:
@@ -629,7 +637,6 @@ class TantivyBackend:
                     if content_snippet:
                         highlights["content"] = str(content_snippet)
 
-                    # Try notes highlights
                     if "notes" in doc_dict:
                         if notes_snippet_generator is None:
                             notes_snippet_generator = tantivy.SnippetGenerator.create(

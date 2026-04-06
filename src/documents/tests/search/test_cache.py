@@ -242,7 +242,7 @@ class TestSearchCacheIntegration:
             sort_reverse=False,
         )
 
-        # Cache holds SearchResults (pure Python types — safely picklable).
+        # Cache holds SearchResults — pure Python types, safely picklable.
         cached = get_search_results_cache(
             "Invoice",
             SearchMode.QUERY,
@@ -409,7 +409,7 @@ class TestSearchCacheIntegration:
             sort_reverse=False,
         )
 
-        # Both should be cached under different keys (one per user).
+        # Both should be cached under different keys — one SearchResults per user.
         cached_super = get_search_results_cache(
             "Shared",
             SearchMode.QUERY,
@@ -491,3 +491,49 @@ class TestSearchCacheIntegration:
             )
             is not None
         )
+
+    def test_text_search_is_case_insensitive_for_cache(
+        self,
+        backend: TantivyBackend,
+    ) -> None:
+        """TEXT/TITLE searches for 'Rechnung' and 'rechnung' must share one cache entry."""
+        doc = Document.objects.create(
+            title="Rechnung 2024",
+            content="Betrag fällig",
+            checksum="DE1",
+            pk=6,
+        )
+        backend.add_or_update(doc)
+
+        r1 = backend.search(
+            "Rechnung",
+            user=None,
+            page=1,
+            page_size=10,
+            sort_field=None,
+            sort_reverse=False,
+            search_mode=SearchMode.TEXT,
+        )
+        # Second search with different casing must be a cache hit returning the same results.
+        r2 = backend.search(
+            "rechnung",
+            user=None,
+            page=1,
+            page_size=10,
+            sort_field=None,
+            sort_reverse=False,
+            search_mode=SearchMode.TEXT,
+        )
+        assert r1.total == r2.total
+        assert [h["id"] for h in r1.hits] == [h["id"] for h in r2.hits]
+
+        # Both queries must map to the same lowercased cache key.
+        cached = get_search_results_cache(
+            "rechnung",
+            SearchMode.TEXT,
+            None,
+            None,
+            sort_reverse=False,
+        )
+        assert cached is not None
+        assert cached.total == r1.total
