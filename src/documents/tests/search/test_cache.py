@@ -330,17 +330,7 @@ class TestSearchCacheIntegration:
         doc.save(update_fields=["title", "checksum"])
         backend.add_or_update(doc)
 
-        # The cached entry for the old query must be gone.
-        assert (
-            get_search_results_cache(
-                "Old Title",
-                SearchMode.TEXT,
-                None,
-                None,
-                sort_reverse=False,
-            )
-            is None
-        )
+        # The QUERY mode cache entry that was populated above must be gone.
         assert (
             get_search_results_cache(
                 "Old Title",
@@ -492,11 +482,18 @@ class TestSearchCacheIntegration:
             is not None
         )
 
-    def test_text_search_is_case_insensitive_for_cache(
+    @pytest.mark.parametrize("mode", [SearchMode.TEXT, SearchMode.TITLE])
+    def test_text_and_title_search_cache_is_case_insensitive(
         self,
         backend: TantivyBackend,
+        mode: SearchMode,
     ) -> None:
-        """TEXT/TITLE searches for 'Rechnung' and 'rechnung' must share one cache entry."""
+        """TEXT and TITLE searches differing only in case must share one cache entry.
+
+        Tantivy lowercases tokens at index and query time, so 'Rechnung' and
+        'rechnung' return identical results.  The cache key must be lowercased
+        so both map to the same entry and the second request is a cache hit.
+        """
         doc = Document.objects.create(
             title="Rechnung 2024",
             content="Betrag fällig",
@@ -512,7 +509,7 @@ class TestSearchCacheIntegration:
             page_size=10,
             sort_field=None,
             sort_reverse=False,
-            search_mode=SearchMode.TEXT,
+            search_mode=mode,
         )
         # Second search with different casing must be a cache hit returning the same results.
         r2 = backend.search(
@@ -522,7 +519,7 @@ class TestSearchCacheIntegration:
             page_size=10,
             sort_field=None,
             sort_reverse=False,
-            search_mode=SearchMode.TEXT,
+            search_mode=mode,
         )
         assert r1.total == r2.total
         assert [h["id"] for h in r1.hits] == [h["id"] for h in r2.hits]
@@ -530,7 +527,7 @@ class TestSearchCacheIntegration:
         # Both queries must map to the same lowercased cache key.
         cached = get_search_results_cache(
             "rechnung",
-            SearchMode.TEXT,
+            mode,
             None,
             None,
             sort_reverse=False,
