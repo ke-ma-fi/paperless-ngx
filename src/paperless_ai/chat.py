@@ -12,6 +12,7 @@ logger = logging.getLogger("paperless_ai.chat")
 CHAT_METADATA_DELIMITER = "\n\n__PAPERLESS_CHAT_METADATA__"
 MAX_CHAT_REFERENCES = 3
 CHAT_RETRIEVER_TOP_K = 5
+CHAT_SCOPED_OVERSAMPLE_FACTOR = 20
 
 CHAT_PROMPT_TMPL = """Context information is below.
     ---------------------
@@ -20,6 +21,16 @@ CHAT_PROMPT_TMPL = """Context information is below.
     Given the context information and not prior knowledge, answer the query.
     Query: {query_str}
     Answer:"""
+
+
+class _FixedNodeRetriever:
+    """Returns pre-fetched, pre-filtered nodes to the query engine without re-querying."""
+
+    def __init__(self, nodes: list) -> None:
+        self._nodes = nodes
+
+    def retrieve(self, *args, **kwargs) -> list:
+        return self._nodes
 
 
 def _build_document_reference(
@@ -69,36 +80,62 @@ def _format_chat_metadata_trailer(references: list[dict[str, int | str]]) -> str
 
 
 def stream_chat_with_documents(query_str: str, documents: list[Document]):
+    from llama_index.core.prompts import PromptTemplate
+    from llama_index.core.query_engine import RetrieverQueryEngine
+    from llama_index.core.response_synthesizers import get_response_synthesizer
+    from llama_index.core.retrievers import VectorIndexRetriever
+
     client = AIClient()
     index = load_or_build_index()
 
-    doc_ids = [str(doc.pk) for doc in documents]
+    doc_ids = {str(doc.pk) for doc in documents}
+    total_nodes = len(index.docstore.docs)
 
-    # Filter only the node(s) that match the document IDs
-    nodes = [
-        node
+    # Collect node IDs for the selected documents.
+    # FAISS has no pre-filter support; we build this set for post-filtering after retrieval.
+    matching_node_ids = {
+        node.node_id
         for node in index.docstore.docs.values()
         if node.metadata.get("document_id") in doc_ids
-    ]
+    }
 
-    if len(nodes) == 0:
+    if not matching_node_ids:
         logger.warning("No nodes found for the given documents.")
         yield "Sorry, I couldn't find any content to answer your question."
         return
 
-    from llama_index.core import VectorStoreIndex
-    from llama_index.core.prompts import PromptTemplate
-    from llama_index.core.query_engine import RetrieverQueryEngine
-    from llama_index.core.response_synthesizers import get_response_synthesizer
-
-    local_index = VectorStoreIndex(nodes=nodes)
-    retriever = local_index.as_retriever(
-        similarity_top_k=CHAT_RETRIEVER_TOP_K,
+    scoped = len(matching_node_ids) < total_nodes
+    # Over-fetch when scoping so the post-filter has enough candidates.
+    # IndexFlatL2 always scans every vector regardless of k, so a larger k
+    # adds only minor overhead while dramatically improving recall within the subset.
+    retrieve_k = (
+        min(total_nodes, CHAT_RETRIEVER_TOP_K * CHAT_SCOPED_OVERSAMPLE_FACTOR)
+        if scoped
+        else CHAT_RETRIEVER_TOP_K
     )
 
-    top_nodes = retriever.retrieve(query_str)
-    if len(top_nodes) == 0:
-        logger.warning("Retriever returned no nodes for the given documents.")
+    retriever = VectorIndexRetriever(index=index, similarity_top_k=retrieve_k)
+    all_results = retriever.retrieve(query_str)
+
+    top_nodes = (
+        [n for n in all_results if n.node.node_id in matching_node_ids][:CHAT_RETRIEVER_TOP_K]
+        if scoped
+        else all_results
+    )
+
+    if not top_nodes:
+        if scoped:
+            # The selected documents have no nodes among the global top candidates.
+            # This happens when those documents are semantically distant from the query.
+            logger.warning(
+                "Retriever returned no nodes within the %d selected documents "
+                "(oversample_k=%d). The document content may be semantically "
+                "distant from the query.",
+                len(doc_ids),
+                retrieve_k,
+            )
+        else:
+            logger.warning("Retriever returned no nodes for the given documents.")
         yield "Sorry, I couldn't find any content to answer your question."
         return
 
@@ -112,8 +149,10 @@ def stream_chat_with_documents(query_str: str, documents: list[Document]):
         streaming=True,
     )
 
+    # Pass pre-filtered nodes directly so the query engine uses only scoped context
+    # and does not issue a second retrieval or embedding call.
     query_engine = RetrieverQueryEngine.from_args(
-        retriever=retriever,
+        retriever=_FixedNodeRetriever(top_nodes),
         llm=client.llm,
         response_synthesizer=response_synthesizer,
         streaming=True,
